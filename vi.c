@@ -125,6 +125,7 @@ struct globals {
  char undo_queue[256];
 };
 static struct globals *ptr_to_globals;
+static volatile sig_atomic_t winch_pending;
 //#define Ureg           (G.Ureg          )
 static void show_status_line(void); // put a message on the bottom line
 static void show_help(void)
@@ -500,7 +501,12 @@ static void refresh(int full_screen)
  if (1 && !(*ptr_to_globals).get_rowcol_error ) {
   unsigned c = ((*ptr_to_globals).columns ), r = ((*ptr_to_globals).rows );
   query_screen_dimensions();
-  full_screen |= (c - ((*ptr_to_globals).columns )) | (r - ((*ptr_to_globals).rows ));
+  if (c != ((*ptr_to_globals).columns ) || r != ((*ptr_to_globals).rows )) {
+   full_screen = 1;
+   // SIGWINCH normally replaces the virtual screen first, but the terminal
+   // can change again between that handler's query and this refresh.
+   new_screen(((*ptr_to_globals).rows ), ((*ptr_to_globals).columns ));
+  }
  }
  sync_cursor(((*ptr_to_globals).dot ), &((*ptr_to_globals).crow ), &((*ptr_to_globals).ccol )); // where cursor will be (on "dot")
  tp = ((*ptr_to_globals).screenbegin ); // index into text[] of top line
@@ -574,6 +580,15 @@ static void redraw(int full_screen)
  refresh(full_screen); // this will redraw the entire display
  show_status_line();
 }
+static void refresh_after_window_change(void)
+{
+ if (!winch_pending)
+  return;
+ winch_pending = 0;
+ query_screen_dimensions();
+ new_screen(((*ptr_to_globals).rows ), ((*ptr_to_globals).columns ));
+ redraw(1); // re-draw the screen outside the signal handler
+}
 //----- Flash the screen  --------------------------------------
 static void flash(int h)
 {
@@ -605,6 +620,10 @@ static int readit(void) // read (maybe cursor) key from stdin
  again:
  c = safe_read_key(0, ((*ptr_to_globals).readbuffer ), /*timeout:*/ -1);
  if (c == -1) { // EOF/error
+  if ((*__errno_location ()) == EINTR) { // interrupted by a signal
+   refresh_after_window_change();
+   goto again;
+  }
   if ((*__errno_location ()) == 11) // paranoia
    goto again;
   go_bottom_and_clear_to_eol();
@@ -2492,26 +2511,20 @@ static char *skip_thing(char *p, int linecnt, int dir, int type)
 }
 static void winch_handler(int sig __attribute__((unused)))
 {
- int save_errno = (*__errno_location ());
- // FIXME: do it in main loop!!!
- signal(28, winch_handler);
- query_screen_dimensions();
- new_screen(((*ptr_to_globals).rows ), ((*ptr_to_globals).columns )); // get memory for virtual screen
- redraw(1); // re-draw the screen
- (*__errno_location ()) = save_errno;
+ winch_pending = 1;
 }
 static void tstp_handler(int sig __attribute__((unused)))
 {
  int save_errno = (*__errno_location ());
  // ioctl inside cookmode() was seen to generate SIGTTOU,
  // stopping us too early. Prevent that:
- signal(22, ((__sighandler_t) 1));
+ signal(SIGTTOU, ((__sighandler_t) 1));
  go_bottom_and_clear_to_eol();
  cookmode(); // terminal to "cooked"
  // stop now
  //signal(SIGTSTP, SIG_DFL);
  //raise(SIGTSTP);
- raise(19); // avoid "dance" with TSTP handler - use SIGSTOP instead
+ raise(SIGSTOP); // avoid "dance" with TSTP handler - use SIGSTOP instead
  //signal(SIGTSTP, tstp_handler);
  // we have been "continued" with SIGCONT, restore screen and termios
  rawmode(); // terminal to "raw"
@@ -2521,7 +2534,7 @@ static void tstp_handler(int sig __attribute__((unused)))
 }
 static void int_handler(int sig)
 {
- signal(2, int_handler);
+ signal(SIGINT, int_handler);
  siglongjmp(((*ptr_to_globals).restart ), sig);
 }
 static void do_cmd(int c);
@@ -3487,15 +3500,16 @@ static void edit_file(char *fn)
  ((*ptr_to_globals).mark )[26] = ((*ptr_to_globals).mark )[27] = ((*ptr_to_globals).text ); // init "previous context"
  ((*ptr_to_globals).crow ) = 0;
  ((*ptr_to_globals).ccol ) = 0;
- signal(28, winch_handler);
- signal(20, tstp_handler);
+ winch_pending = 0;
+ signal(SIGWINCH, winch_handler);
+ signal(SIGTSTP, tstp_handler);
  sig = __sigsetjmp (((*ptr_to_globals).restart ), 1);
  if (sig != 0) {
   ((*ptr_to_globals).screenbegin ) = ((*ptr_to_globals).dot ) = ((*ptr_to_globals).text );
  }
  // int_handler() can jump to "restart",
  // must install handler *after* initializing "restart"
- signal(2, int_handler);
+ signal(SIGINT, int_handler);
  ((*ptr_to_globals).cmd_mode ) = 0; // 0=command  1=insert  2='R'eplace
  ((*ptr_to_globals).cmdcnt ) = 0;
  ((*ptr_to_globals).offset ) = 0; // no horizontal offset
@@ -3525,11 +3539,13 @@ static void edit_file(char *fn)
    start_new_cmd_q(c);
   }
   do_cmd(c); // execute the user command
+  refresh_after_window_change();
   // poll to see if there is input already waiting. if we are
   // not able to display output fast enough to keep up, skip
   // the display update until we catch up with input.
   if (!((*ptr_to_globals).readbuffer )[0] && mysleep(0) == 0) {
    // no input pending - so update output
+   refresh_after_window_change();
    refresh(0);
    show_status_line();
   }
