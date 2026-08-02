@@ -5,6 +5,9 @@ edition = "2021"
 description = "A small, safe, vi-like editor"
 license = "GPL-2.0-or-later"
 
+[dependencies]
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
+
 [lib]
 name = "busy_v"
 path = "src/lib.rs"

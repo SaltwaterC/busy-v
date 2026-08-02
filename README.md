@@ -4,13 +4,14 @@ busy-v is a Rust port of the independently extracted BusyBox vi clone. The
 original C implementation has been kept for reference and for comparison
 testing.
 
-The Rust implementation owns its text buffer, uses no `unsafe` code and has no
-third-party dependencies. It provides command and insert modes, file I/O,
+The Rust implementation owns its text buffer and uses the cross-platform
+`crossterm` crate for terminal integration. It provides command and insert modes, file I/O,
 colon commands, small regex-style search/substitution, yank/put and named registers,
 undo/redo, marks, multi-file navigation, startup `EXINIT`/`.exrc`,
 autoindent, replacement, and common movement and editing commands. The
-terminal integration is kept small and uses the host `stty` utility for raw
-mode.
+terminal integration uses the crate's native raw-mode, event, alternate-screen,
+and sizing support on Unix and Windows; it does not require a shell utility or
+project-local platform FFI for terminal handling.
 
 While the editor is functional and care has been taken to make sure it matches the
 reference version, there are two potential sources for bugs:
@@ -39,6 +40,9 @@ make analyze
 make test
 ```
 
+On Windows, `make` or `cargo build --release` builds `vi.exe`; the C reference
+and POSIX PTY comparison scripts are Unix-only.
+
 The tests include public core-editor integration tests in
 `tests/editor_core.rs`, a Rust PTY smoke test, and reference functional tests
 in `tests/reference.sh` that run identical keyboard sequences through `vi-c`
@@ -47,6 +51,6 @@ covered. The smoke test also verifies that terminal raw mode processes input
 before a newline, that the configured terminal dimensions are used, and that
 repeated pane-style resize/restore events leave the C reference cursor live.
 `make analyze` runs Clang's core, dead-store, allocation, and C-string checks
-on the C reference and Clippy plus an `unsafe`-code check on Rust. The source
+on the C reference and Clippy on Rust. The source
 is GPLv2-or-later, matching the BusyBox source from which the editor was
 extracted.

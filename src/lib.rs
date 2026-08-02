@@ -9,8 +9,29 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, ExecutableCommand};
+
+#[cfg(unix)]
+mod platform_user {
+    use std::os::raw::c_uint;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[link(name = "c")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn getuid() -> c_uint;
+    }
+
+    pub(crate) fn current_uid() -> Option<u32> {
+        // SAFETY: getuid has no pointer arguments and cannot invalidate Rust
+        // references.
+        Some(unsafe { getuid() })
+    }
+}
 const HELP: &str = "These features are available:\n\
 \tPattern searches with / and ?\n\
 \tLast command repeat with .\n\
@@ -52,52 +73,31 @@ enum Operator {
 }
 
 struct Terminal {
-    saved: Option<String>,
-    alternate_screen: bool,
-}
-
-fn stty_command() -> Command {
-    let mut command = Command::new("stty");
-    command.stdin(Stdio::inherit());
-    command
+    active: bool,
 }
 
 impl Terminal {
     fn enter() -> io::Result<Self> {
-        let saved = stty_command().arg("-g").output()?;
-        if !saved.status.success() {
-            return Err(io::Error::other("vi: standard input is not a terminal"));
+        terminal::enable_raw_mode()?;
+        let mut out = io::stdout();
+        if let Err(error) = out.execute(EnterAlternateScreen) {
+            let _ = terminal::disable_raw_mode();
+            return Err(error);
         }
-        let state = String::from_utf8_lossy(&saved.stdout).trim().to_owned();
-        let changed = stty_command()
-            .args(["raw", "-echo", "min", "0", "time", "1"])
-            .status()?;
-        if !changed.success() {
-            return Err(io::Error::other("vi: could not enable raw terminal mode"));
-        }
-        let mut out = io::stdout().lock();
-        write!(out, "\x1b[?1049h")?;
-        out.flush()?;
-        Ok(Self {
-            saved: Some(state),
-            alternate_screen: true,
-        })
+        Ok(Self { active: true })
     }
 
     fn interactive(&self) -> bool {
-        self.saved.is_some()
+        self.active
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if self.alternate_screen {
-            let mut out = io::stdout().lock();
-            let _ = write!(out, "\x1b[?1049l");
-            let _ = out.flush();
-        }
-        if let Some(state) = &self.saved {
-            let _ = stty_command().arg(state).status();
+        if self.active {
+            let mut out = io::stdout();
+            let _ = execute!(out, LeaveAlternateScreen);
+            let _ = terminal::disable_raw_mode();
         }
     }
 }
@@ -107,6 +107,7 @@ struct KeyReader {
     pending: VecDeque<u8>,
     timed_input: bool,
     special: bool,
+    events: bool,
 }
 
 impl KeyReader {
@@ -116,6 +117,7 @@ impl KeyReader {
             pending: VecDeque::new(),
             timed_input,
             special: false,
+            events: timed_input,
         }
     }
 
@@ -125,6 +127,7 @@ impl KeyReader {
             pending: bytes.iter().copied().collect(),
             timed_input: false,
             special: false,
+            events: false,
         }
     }
 
@@ -173,6 +176,9 @@ impl KeyReader {
     }
 
     fn try_key(&mut self) -> io::Result<Option<u8>> {
+        if self.events {
+            return self.try_event_key(false);
+        }
         self.special = false;
         let Some(byte) = self.try_byte()? else {
             return Ok(None);
@@ -218,11 +224,96 @@ impl KeyReader {
     }
 
     fn key(&mut self) -> io::Result<u8> {
+        if self.events {
+            loop {
+                if let Some(key) = self.try_event_key(true)? {
+                    return Ok(key);
+                }
+            }
+        }
         loop {
             if let Some(key) = self.try_key()? {
                 return Ok(key);
             }
         }
+    }
+
+    fn try_event_key(&mut self, blocking: bool) -> io::Result<Option<u8>> {
+        self.special = false;
+        loop {
+            if !blocking && !event::poll(std::time::Duration::from_millis(50))? {
+                return Ok(None);
+            }
+            match event::read()? {
+                Event::Key(key) => {
+                    if let Some(value) = self.push_event_key(key) {
+                        return Ok(Some(value));
+                    }
+                    if !blocking {
+                        return Ok(None);
+                    }
+                }
+                Event::Resize(_, _) => return Ok(None),
+                _ if !blocking => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+
+    fn push_event_key(&mut self, key: KeyEvent) -> Option<u8> {
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        let value = match key.code {
+            KeyCode::Up => {
+                self.special = true;
+                0x80
+            }
+            KeyCode::Down => {
+                self.special = true;
+                0x81
+            }
+            KeyCode::Right => {
+                self.special = true;
+                0x82
+            }
+            KeyCode::Left => {
+                self.special = true;
+                0x83
+            }
+            KeyCode::Home => {
+                self.special = true;
+                0x84
+            }
+            KeyCode::End => {
+                self.special = true;
+                0x85
+            }
+            KeyCode::Insert => {
+                self.special = true;
+                0x86
+            }
+            KeyCode::Delete => {
+                self.special = true;
+                0x87
+            }
+            KeyCode::Backspace => 8,
+            KeyCode::Enter => b'\r',
+            KeyCode::Tab => b'\t',
+            KeyCode::Esc => 0x1b,
+            KeyCode::Char(character) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && character.is_ascii() {
+                    (character.to_ascii_uppercase() as u8) & 0x1f
+                } else {
+                    let mut encoded = [0u8; 4];
+                    let encoded = character.encode_utf8(&mut encoded);
+                    self.pending.extend(encoded.bytes());
+                    return self.pending.pop_front();
+                }
+            }
+            _ => return None,
+        };
+        Some(value)
     }
 }
 
@@ -704,21 +795,9 @@ impl Editor {
             let columns = std::env::var("COLUMNS").ok()?.parse::<usize>().ok()?;
             (rows > 0 && columns > 0).then_some((rows, columns))
         };
-        let from_tty = stty_command().arg("size").output().ok().and_then(|output| {
-            if !output.status.success() {
-                return None;
-            }
-            let values = String::from_utf8_lossy(&output.stdout)
-                .split_whitespace()
-                .map(str::parse::<usize>)
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?;
-            if values.len() == 2 {
-                Some((values[0], values[1]))
-            } else {
-                None
-            }
-        });
+        let from_tty = terminal::size()
+            .ok()
+            .map(|(columns, rows)| (rows as usize, columns as usize));
         let (rows, columns) = from_tty.or(from_environment()).unwrap_or((24, 80));
         let rows = rows.clamp(2, 512);
         let columns = columns.clamp(10, 4096);
@@ -925,11 +1004,13 @@ impl Editor {
 
     fn prompt(&mut self, reader: &mut KeyReader, prefix: &str) -> io::Result<Option<Vec<u8>>> {
         let mut value = Vec::new();
+        let mut prompt = prefix.to_owned();
+        self.render(Some(&prompt))?;
         loop {
-            let prompt = format!("{}{}", prefix, String::from_utf8_lossy(&value));
-            self.render(Some(&prompt))?;
             let Some(key) = reader.try_key()? else {
-                self.refresh_size();
+                if self.refresh_size() {
+                    self.render(Some(&prompt))?;
+                }
                 continue;
             };
             let _ = reader.take_special();
@@ -942,6 +1023,8 @@ impl Editor {
                 byte if byte.is_ascii() && !byte.is_ascii_control() => value.push(byte),
                 _ => {}
             }
+            prompt = format!("{}{}", prefix, String::from_utf8_lossy(&value));
+            self.render(Some(&prompt))?;
         }
     }
 
@@ -3262,7 +3345,7 @@ fn startup_commands() -> (Vec<String>, Option<String>) {
             None,
         );
     }
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
         return (Vec::new(), None);
     };
     let path = PathBuf::from(home).join(".exrc");
@@ -3271,10 +3354,13 @@ fn startup_commands() -> (Vec<String>, Option<String>) {
     };
     #[cfg(unix)]
     if std::os::unix::fs::MetadataExt::mode(&metadata) & 0o022 != 0
-        || current_uid().is_none_or(|uid| std::os::unix::fs::MetadataExt::uid(&metadata) != uid)
+        || platform_user::current_uid()
+            .is_none_or(|uid| std::os::unix::fs::MetadataExt::uid(&metadata) != uid)
     {
         return (Vec::new(), Some(".exrc: permission denied".into()));
     }
+    #[cfg(not(unix))]
+    let _ = &metadata;
     (
         fs::read_to_string(path)
             .map(|contents| {
@@ -3288,15 +3374,6 @@ fn startup_commands() -> (Vec<String>, Option<String>) {
             .unwrap_or_default(),
         None,
     )
-}
-
-#[cfg(unix)]
-fn current_uid() -> Option<u32> {
-    let output = Command::new("id").arg("-u").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 pub fn run(arguments: Vec<String>) -> i32 {
@@ -3408,6 +3485,38 @@ pub fn run(arguments: Vec<String>) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod terminal_event_tests {
+    use super::*;
+
+    #[test]
+    fn crossterm_events_preserve_editor_key_contract() {
+        let mut reader = KeyReader::from_bytes(&[]);
+        assert_eq!(
+            reader.push_event_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Some(0x82)
+        );
+        assert!(reader.take_special());
+        assert_eq!(
+            reader.push_event_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(3)
+        );
+        assert_eq!(
+            reader.push_event_key(KeyEvent::new_with_kind(
+                KeyCode::Char('!'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            )),
+            None
+        );
+        assert_eq!(
+            reader.push_event_key(KeyEvent::new(KeyCode::Char('¬'), KeyModifiers::NONE)),
+            Some(0xc2)
+        );
+        assert_eq!(reader.pending.pop_front(), Some(0xac));
+    }
 }
 
 // Core behavioral tests live in tests/editor_core.rs so the editor source
