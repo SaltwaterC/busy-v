@@ -165,6 +165,37 @@ fn arrow_keys_move_without_inserting_escape_bytes() {
 }
 
 #[test]
+fn page_keys_scroll_by_a_full_viewport_without_inserting_escape_bytes() {
+    let data = (1..=100)
+        .map(|line| format!("line{line:03}\n"))
+        .collect::<String>();
+    let mut editor = Editor::from_bytes(data.as_bytes(), None, false);
+
+    editor.execute_keys(b"\x1b[6~").expect("page down movement");
+    assert_eq!(editor.cursor(), (22, 0));
+
+    editor
+        .execute_keys(b"i\x1b[5~X\x1b")
+        .expect("page up and insert");
+    assert_eq!(editor.cursor(), (22, 0));
+    assert!(editor
+        .bytes()
+        .windows(b"Xline023".len())
+        .any(|window| window == b"Xline023"));
+}
+
+#[test]
+fn set_number_accepts_long_and_short_forms() {
+    let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+
+    editor.execute_ex("set number");
+    editor.execute_ex("set nonu");
+    editor.execute_ex("set nu");
+
+    assert_eq!(editor.status(), "");
+}
+
+#[test]
 fn home_and_end_move_the_insert_cursor_without_inserting_escape_bytes() {
     let mut editor = Editor::from_bytes(b"abc\n", None, false);
     editor

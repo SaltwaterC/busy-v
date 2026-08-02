@@ -30,6 +30,14 @@ printf 'abc\n' >"$raw_file"
 } | script -qefc "$root/vi $raw_file" "$raw_log" >/dev/null 2>&1
 test ! -e "$tmp/raw-mode-failed"
 
+number_log="$tmp/number.session.log"
+number_file="$tmp/number-file"
+printf 'one\ntwo\n' >"$number_file"
+{ sleep 1; printf ':set number\n'; sleep 0.2; printf ':q!\n'; } |
+	script -qefc "stty rows 8 cols 40; exec $root/vi $number_file" "$number_log" >/dev/null 2>&1
+grep -a -F -q '  1 one' "$number_log"
+grep -a -F -q '  2 two' "$number_log"
+
 size_log="$tmp/size.session.log"
 size_file="$tmp/size-file"
 i=0

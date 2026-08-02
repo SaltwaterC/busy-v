@@ -32,6 +32,12 @@ Unlike the reference version, the resulting binary is large by comparison. Not b
 a tiny margin. Almost 7X larger. I chose BusyBox's implementation as reference as
 it makes porting far easier when the footprint after removing dead code is ~3kloc.
 
+## Additional features
+
+ * Native Windows support
+ * :set number for line numbering
+ * Page Up/Down work as expected
+
 ## Build and test
 
 ```sh

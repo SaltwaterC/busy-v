@@ -207,9 +207,11 @@ impl KeyReader {
             b'~' if matches!(sequence.first(), Some(b'4') | Some(b'8')) => 0x85,
             b'~' if sequence.first() == Some(&b'2') => 0x86,
             b'~' if sequence.first() == Some(&b'3') => 0x87,
+            b'~' if sequence.first() == Some(&b'5') => 0x88,
+            b'~' if sequence.first() == Some(&b'6') => 0x89,
             _ => 0x1b,
         };
-        self.special = (0x80..=0x87).contains(&key);
+        self.special = (0x80..=0x89).contains(&key);
         Ok(Some(key))
     }
 
@@ -286,6 +288,14 @@ impl KeyReader {
             KeyCode::Delete => {
                 self.special = true;
                 0x87
+            }
+            KeyCode::PageUp => {
+                self.special = true;
+                0x88
+            }
+            KeyCode::PageDown => {
+                self.special = true;
+                0x89
             }
             KeyCode::Backspace => 8,
             KeyCode::Enter => b'\r',
@@ -803,8 +813,16 @@ impl Editor {
 
     fn horizontal_width(&self) -> usize {
         self.screen_cols
-            .saturating_sub(if self.number { 8 } else { 0 })
+            .saturating_sub(self.number_column_width())
             .max(1)
+    }
+
+    fn number_column_width(&self) -> usize {
+        if self.number {
+            self.lines.len().to_string().len().max(3) + 1
+        } else {
+            0
+        }
     }
 
     fn sync_screen(&mut self) {
@@ -932,7 +950,8 @@ impl Editor {
                 continue;
             }
             let prefix = if self.number {
-                format!("{:>6}  ", index + 1).into_bytes()
+                let width = self.number_column_width().saturating_sub(1);
+                format!("{:>width$} ", index + 1, width = width).into_bytes()
             } else {
                 Vec::new()
             };
@@ -980,9 +999,7 @@ impl Editor {
             let mut screen_col = self
                 .line_display_width(&self.lines[self.row], self.col)
                 .saturating_sub(self.screen_left);
-            if self.number {
-                screen_col += 8;
-            }
+            screen_col += self.number_column_width();
             (
                 screen_row.min(body).max(1),
                 screen_col.min(self.screen_cols.saturating_sub(1)) + 1,
@@ -2244,10 +2261,10 @@ impl Editor {
             4 => {
                 self.scroll_screen(self.screen_rows.saturating_sub(2) / 2, 1);
             }
-            2 => {
+            2 | 0x88 => {
                 self.scroll_screen(self.screen_rows.saturating_sub(2), -1);
             }
-            6 => {
+            6 | 0x89 => {
                 self.scroll_screen(self.screen_rows.saturating_sub(2), 1);
             }
             21 => {
@@ -2478,6 +2495,13 @@ impl Editor {
                 self.lines[self.row].remove(self.col);
             }
             self.end_change();
+            return Ok(());
+        }
+        if special && (key == 0x88 || key == 0x89) {
+            self.scroll_screen(
+                self.screen_rows.saturating_sub(2),
+                if key == 0x88 { -1 } else { 1 },
+            );
             return Ok(());
         }
         if key == b'\t' && self.expandtab {
