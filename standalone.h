@@ -1,6 +1,6 @@
 /* Small POSIX compatibility layer for the extracted vi editor. */
-#ifndef STANDALONE_VI_H
-#define STANDALONE_VI_H
+#ifndef BUSY_V_H
+#define BUSY_V_H
 
 #define _GNU_SOURCE
 #include <ctype.h>
@@ -156,9 +156,8 @@ static ssize_t full_write(int fd, const void *buf, size_t len)
 
 static int safe_poll(struct pollfd *fds, nfds_t n, int timeout)
 {
-	int r;
-	do r = poll(fds, n, timeout); while (r < 0 && errno == EINTR);
-	return r;
+	/* Let SIGWINCH interrupt the editor's input wait. */
+	return poll(fds, n, timeout);
 }
 
 static int get_terminal_width_height(int fd, unsigned *width, unsigned *height)
@@ -313,18 +312,27 @@ static int read_key_sequence(int fd, char *buffer, int timeout)
 {
 	struct pollfd pfd = { .fd = fd, .events = POLLIN };
 	unsigned char c;
+	errno = 0;
 	if (!buffer[0]) {
 		if (timeout >= -1 && safe_poll(&pfd, 1, timeout < 0 ? -1 : timeout) <= 0) return -1;
-		if (safe_read(fd, &c, 1) != 1) return -1;
+		if (read(fd, &c, 1) != 1) return -1;
 	} else {
 		c = (unsigned char)buffer[1];
 		memmove(buffer, buffer + 1, (unsigned char)buffer[0]--);
 	}
 	if (c != 27) return c;
-	if (safe_poll(&pfd, 1, 50) <= 0) return 27;
-	if (safe_read(fd, &buffer[1], 1) != 1) return 27;
+	{
+		int ready = safe_poll(&pfd, 1, 50);
+		if (ready < 0) return -1;
+		if (ready == 0) return 27;
+	}
+	if (read(fd, &buffer[1], 1) != 1) return -1;
 	if (buffer[1] != '[' && buffer[1] != 'O') { buffer[0] = 1; return 27; }
-	if (safe_poll(&pfd, 1, 50) <= 0 || safe_read(fd, &buffer[2], 1) != 1) { buffer[0] = 0; return 27; }
+	{
+		int ready = safe_poll(&pfd, 1, 50);
+		if (ready < 0) return -1;
+		if (ready == 0 || read(fd, &buffer[2], 1) != 1) { buffer[0] = 0; return 27; }
+	}
 	buffer[0] = 0;
 	if (buffer[2] == 'A') return KEYCODE_UP;
 	if (buffer[2] == 'B') return KEYCODE_DOWN;
@@ -339,9 +347,7 @@ static int read_key_sequence(int fd, char *buffer, int timeout)
 
 static int64_t safe_read_key(int fd, char *buffer, int timeout)
 {
-	int64_t r;
-	do { r = read_key_sequence(fd, buffer, timeout); } while (r < 0 && errno == EINTR);
-	return r;
+	return read_key_sequence(fd, buffer, timeout);
 }
 
 #define vi_main main

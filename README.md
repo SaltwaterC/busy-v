@@ -1,16 +1,37 @@
-# Standalone vi
+# busy-v
 
-This directory is an independent extraction of BusyBox `editors/vi.c`. It
-builds a regular POSIX-hosted `vi` executable without BusyBox or `libbb`.
+busy-v is a Rust port of the independently extracted BusyBox vi clone. The
+original C implementation has been kept for reference and for comparison
+testing.
 
-The extracted build enables the normal vi features (colon commands, search,
-yank/put, undo, signals, resizing, and read-only mode), uses POSIX regex, and
-omits BusyBox's disabled CRASHME test code. `vi.c` is the specialized output
-of Clang's preprocessor, so unused feature branches and their configuration
-scaffolding are absent from the source. `standalone.h` supplies only the
-small libc/POSIX compatibility routines still required by the editor.
+The Rust implementation owns its text buffer, uses no `unsafe` code and has no
+third-party dependencies. It provides command and insert modes, file I/O,
+colon commands, small regex-style search/substitution, yank/put and named registers,
+undo/redo, marks, multi-file navigation, startup `EXINIT`/`.exrc`,
+autoindent, replacement, and common movement and editing commands. The
+terminal integration is kept small and uses the host `stty` utility for raw
+mode.
 
-Build and test:
+While the editor is functional and care has been taken to make sure it matches the
+reference version, there are two potential sources for bugs:
+
+  1. Extraction bugs when the reference version was separated from BusyBox.
+  2. Porting bugs where the feature was not reimplemented entirely the same.
+
+This is not a c2rust port as the RustyBox experiment shows that 5kloc of C
+can become 97kloc of unmaintainable and unreadable Rust while still importing
+usafe calls. This is more of a reimplementation using the C version as reference.
+
+That being said, the world does not need another vi clone. This project exists for
+one purpose only: have a minimal vi-like editor that I can embed into
+[Zetta](https://github.com/SaltwaterC/zetta) as fallback editor on all supported
+platforms.
+
+Unlike the reference version, the resulting binary is large by comparison. Not by
+a tiny margin. Almost 7X larger. I chose BusyBox's implementation as reference as
+it makes porting far easier when the footprint after removing dead code is ~3kloc.
+
+## Build and test
 
 ```sh
 make
@@ -18,6 +39,14 @@ make analyze
 make test
 ```
 
-The smoke test runs the binary under a pseudo-terminal, inserts text, and
-saves it with `:wq`. The source is GPLv2-or-later, matching the BusyBox source
-from which it was extracted.
+The tests include public core-editor integration tests in
+`tests/editor_core.rs`, a Rust PTY smoke test, and reference functional tests
+in `tests/reference.sh` that run identical keyboard sequences through `vi-c`
+and `vi`. Arrow-key CSI sequences, including sequences split across reads, are
+covered. The smoke test also verifies that terminal raw mode processes input
+before a newline, that the configured terminal dimensions are used, and that
+repeated pane-style resize/restore events leave the C reference cursor live.
+`make analyze` runs Clang's core, dead-store, allocation, and C-string checks
+on the C reference and Clippy plus an `unsafe`-code check on Rust. The source
+is GPLv2-or-later, matching the BusyBox source from which the editor was
+extracted.

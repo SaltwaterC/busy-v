@@ -1,0 +1,20 @@
+[package]
+name = "busy-v"
+version = "0.1.0"
+edition = "2021"
+description = "A small, safe, vi-like editor"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "busy_v"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vi"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
