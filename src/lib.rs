@@ -16,20 +16,10 @@ use crossterm::{execute, ExecutableCommand};
 
 #[cfg(unix)]
 mod platform_user {
-    use std::os::raw::c_uint;
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[link(name = "c")]
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    #[link(name = "System")]
-    unsafe extern "C" {
-        fn getuid() -> c_uint;
-    }
-
     pub(crate) fn current_uid() -> Option<u32> {
-        // SAFETY: getuid has no pointer arguments and cannot invalidate Rust
-        // references.
-        Some(unsafe { getuid() })
+        // SAFETY: libc provides the platform-correct ABI for getuid, which
+        // takes no pointers and returns a plain user ID.
+        Some(unsafe { libc::getuid() as u32 })
     }
 }
 const HELP: &str = "These features are available:\n\
