@@ -62,6 +62,158 @@ enum Operator {
     Change,
 }
 
+/// A terminal color supplied by an embedding application's syntax theme.
+///
+/// The editor does not know anything about programming languages or token
+/// classes.  It only uses these colors when an embedding application installs
+/// a [`SyntaxHighlighter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HighlightColor {
+    /// An entry in the terminal's 256-color palette.
+    Ansi(u8),
+    /// A true-color RGB value.
+    Rgb { red: u8, green: u8, blue: u8 },
+}
+
+/// Presentation attributes for one syntax-highlighted range.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HighlightStyle {
+    pub foreground: Option<HighlightColor>,
+    pub background: Option<HighlightColor>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+impl HighlightStyle {
+    /// A style that leaves the terminal in its normal presentation.
+    pub const fn plain() -> Self {
+        Self {
+            foreground: None,
+            background: None,
+            bold: false,
+            italic: false,
+            underline: false,
+        }
+    }
+
+    /// Construct a style with only a foreground color.
+    pub const fn foreground(color: HighlightColor) -> Self {
+        Self {
+            foreground: Some(color),
+            ..Self::plain()
+        }
+    }
+
+    /// Construct a style with only a background color.
+    pub const fn background(color: HighlightColor) -> Self {
+        Self {
+            background: Some(color),
+            ..Self::plain()
+        }
+    }
+
+    pub const fn with_foreground(mut self, color: HighlightColor) -> Self {
+        self.foreground = Some(color);
+        self
+    }
+
+    pub const fn with_background(mut self, color: HighlightColor) -> Self {
+        self.background = Some(color);
+        self
+    }
+
+    pub const fn with_bold(mut self, bold: bool) -> Self {
+        self.bold = bold;
+        self
+    }
+
+    pub const fn with_italic(mut self, italic: bool) -> Self {
+        self.italic = italic;
+        self
+    }
+
+    pub const fn with_underline(mut self, underline: bool) -> Self {
+        self.underline = underline;
+        self
+    }
+
+    fn is_plain(self) -> bool {
+        self == Self::plain()
+    }
+
+    fn write_sgr<W: Write>(self, out: &mut W) -> io::Result<()> {
+        let mut codes = Vec::with_capacity(5);
+        if self.bold {
+            codes.push("1".to_owned());
+        }
+        if self.italic {
+            codes.push("3".to_owned());
+        }
+        if self.underline {
+            codes.push("4".to_owned());
+        }
+        if let Some(color) = self.foreground {
+            codes.push(color.sgr_code(38));
+        }
+        if let Some(color) = self.background {
+            codes.push(color.sgr_code(48));
+        }
+        if codes.is_empty() {
+            return Ok(());
+        }
+        write!(out, "\x1b[{}m", codes.join(";"))
+    }
+}
+
+impl HighlightColor {
+    fn sgr_code(self, channel: u8) -> String {
+        match self {
+            Self::Ansi(value) => format!("{channel};5;{value}"),
+            Self::Rgb { red, green, blue } => format!("{channel};2;{red};{green};{blue}"),
+        }
+    }
+}
+
+/// A half-open byte range in the complete editor buffer and its terminal
+/// presentation. Ranges should be sorted, non-overlapping, and within the
+/// buffer passed to the highlighter. Invalid or overlapping ranges are safely
+/// clipped when the editor renders them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HighlightSpan {
+    pub start: usize,
+    pub end: usize,
+    pub style: HighlightStyle,
+}
+
+impl HighlightSpan {
+    pub const fn new(start: usize, end: usize, style: HighlightStyle) -> Self {
+        Self { start, end, style }
+    }
+}
+
+/// A host-provided syntax highlighter.
+///
+/// The base editor deliberately contains no language grammars, parser, or
+/// theme. The embedding application can install any highlighter it already
+/// uses (for example, an adapter around Zed's syntax service). The callback
+/// receives the complete current buffer and returns byte ranges relative to
+/// that buffer. It is called lazily on the next redraw or
+/// [`Editor::syntax_highlights`] access after edits, and can retain parser
+/// state between calls if that is useful.
+pub trait SyntaxHighlighter {
+    fn highlight(&mut self, buffer: &[u8]) -> Vec<HighlightSpan>;
+}
+
+impl<F> SyntaxHighlighter for F
+where
+    F: FnMut(&[u8]) -> Vec<HighlightSpan>,
+{
+    fn highlight(&mut self, buffer: &[u8]) -> Vec<HighlightSpan> {
+        self(buffer)
+    }
+}
+
 struct Terminal {
     active: bool,
 }
@@ -361,6 +513,9 @@ pub struct Editor {
     screen_cols: usize,
     screen_top: usize,
     screen_left: usize,
+    syntax_highlighter: Option<Box<dyn SyntaxHighlighter>>,
+    syntax_highlights: Vec<HighlightSpan>,
+    syntax_highlights_dirty: bool,
 }
 
 impl Editor {
@@ -422,6 +577,9 @@ impl Editor {
             screen_top: 0,
             screen_left: 0,
             marks: [None; 26],
+            syntax_highlighter: None,
+            syntax_highlights: Vec::new(),
+            syntax_highlights_dirty: false,
         };
         editor.set_bytes(data);
         editor
@@ -517,6 +675,44 @@ impl Editor {
         self.quit
     }
 
+    /// Install a host-provided syntax highlighter for the terminal renderer.
+    ///
+    /// The highlighter is deliberately owned by the editor so it can retain
+    /// parser state between redraws. Use [`Editor::clear_syntax_highlighter`]
+    /// to return to the unstyled base renderer. A closure can be supplied
+    /// directly because closures implementing `FnMut(&[u8]) -> Vec<HighlightSpan>`
+    /// implement [`SyntaxHighlighter`].
+    pub fn set_syntax_highlighter(&mut self, highlighter: Box<dyn SyntaxHighlighter>) {
+        self.syntax_highlighter = Some(highlighter);
+        self.syntax_highlights_dirty = true;
+    }
+
+    /// Remove the optional syntax highlighter and restore plain rendering.
+    pub fn clear_syntax_highlighter(&mut self) {
+        self.syntax_highlighter = None;
+        self.syntax_highlights.clear();
+        self.syntax_highlights_dirty = false;
+    }
+
+    /// Tell the installed highlighter to recompute even when the buffer did
+    /// not change, for example after the embedding application changes its
+    /// theme or language selection.
+    pub fn invalidate_syntax_highlighting(&mut self) {
+        if self.syntax_highlighter.is_some() {
+            self.syntax_highlights_dirty = true;
+        }
+    }
+
+    /// Return the installed highlighter's current ranges in complete-buffer
+    /// byte offsets. This lets a non-terminal embedding reuse the same
+    /// host-provided highlighting data in its own renderer.
+    pub fn syntax_highlights(&mut self) -> Option<&[HighlightSpan]> {
+        self.refresh_syntax_highlighting();
+        self.syntax_highlighter
+            .as_ref()
+            .map(|_| self.syntax_highlights.as_slice())
+    }
+
     /// Feed decoded terminal bytes through the editor without taking over a
     /// terminal. This is useful for embedders and behavioral tests; the
     /// terminal integration is exercised by `tests/reference.sh`.
@@ -557,6 +753,20 @@ impl Editor {
         self.col = 0;
         self.screen_top = 0;
         self.screen_left = 0;
+        self.syntax_highlights_dirty = self.syntax_highlighter.is_some();
+    }
+
+    fn refresh_syntax_highlighting(&mut self) {
+        if !self.syntax_highlights_dirty {
+            return;
+        }
+        let data = self.bytes();
+        self.syntax_highlights = self
+            .syntax_highlighter
+            .as_mut()
+            .map(|highlighter| highlighter.highlight(&data))
+            .unwrap_or_default();
+        self.syntax_highlights_dirty = false;
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -609,6 +819,7 @@ impl Editor {
         self.col = snapshot.col.min(self.lines[self.row].len());
         self.trailing_newline = snapshot.trailing_newline;
         self.modified = snapshot.modified;
+        self.syntax_highlights_dirty = self.syntax_highlighter.is_some();
     }
 
     fn begin_change(&mut self) {
@@ -618,6 +829,7 @@ impl Editor {
             self.change_open = true;
         }
         self.modified = true;
+        self.syntax_highlights_dirty = self.syntax_highlighter.is_some();
     }
 
     fn end_change(&mut self) {
@@ -909,11 +1121,7 @@ impl Editor {
     fn edit_status(&self) -> String {
         let current = self.row + 1;
         let total = self.lines.len();
-        let percent = if total == 0 {
-            100
-        } else {
-            current * 100 / total
-        };
+        let percent = current * 100 / total.max(1);
         let mode = match self.mode {
             Mode::Command => '-',
             Mode::Insert => 'I',
@@ -938,10 +1146,13 @@ impl Editor {
 
     fn render(&mut self, prompt: Option<&str>) -> io::Result<()> {
         self.sync_screen();
+        self.refresh_syntax_highlighting();
         let mut out = io::stdout().lock();
         write!(out, "\x1b[2J\x1b[H")?;
         let body = self.body_rows();
         let width = self.horizontal_width();
+        let syntax_enabled = self.syntax_highlighter.is_some();
+        let line_offsets = line_offsets(&self.lines);
         for screen_line in 0..body {
             let index = self.screen_top + screen_line;
             write!(out, "\x1b[{};1H", screen_line + 1)?;
@@ -956,10 +1167,22 @@ impl Editor {
                 Vec::new()
             };
             out.write_all(&prefix)?;
-            let formatted = self.formatted_line(&self.lines[index]);
-            let start = self.screen_left.min(formatted.len());
-            let end = start.saturating_add(width).min(formatted.len());
-            out.write_all(&formatted[start..end])?;
+            if syntax_enabled {
+                write_highlighted_line(
+                    &mut out,
+                    &self.lines[index],
+                    line_offsets[index],
+                    &self.syntax_highlights,
+                    self.screen_left,
+                    width,
+                    self.tabstop,
+                )?;
+            } else {
+                let formatted = self.formatted_line(&self.lines[index]);
+                let start = self.screen_left.min(formatted.len());
+                let end = start.saturating_add(width).min(formatted.len());
+                out.write_all(&formatted[start..end])?;
+            }
             write!(out, "\x1b[K")?;
         }
         write!(out, "\x1b[{};1H\x1b[K", self.screen_rows)?;
@@ -2045,7 +2268,7 @@ impl Editor {
                     let last = (self.row + count).min(self.lines.len());
                     for line in &mut self.lines[self.row..last] {
                         if command == b'>' {
-                            line.splice(0..0, [b'\t']);
+                            line.splice(0..0, *b"\t");
                         } else if line.first() == Some(&b'\t') {
                             line.remove(0);
                         } else {
@@ -2577,6 +2800,74 @@ impl Editor {
     }
 }
 
+fn line_offsets(lines: &[Vec<u8>]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(lines.len());
+    let mut offset = 0;
+    for line in lines {
+        offsets.push(offset);
+        offset += line.len() + 1;
+    }
+    offsets
+}
+
+fn highlighted_style_at(spans: &[HighlightSpan], offset: usize) -> Option<HighlightStyle> {
+    spans
+        .iter()
+        .find(|span| span.start <= offset && offset < span.end)
+        .map(|span| span.style)
+        .filter(|style| !style.is_plain())
+}
+
+fn write_highlighted_line<W: Write>(
+    out: &mut W,
+    line: &[u8],
+    line_start: usize,
+    spans: &[HighlightSpan],
+    screen_left: usize,
+    width: usize,
+    tabstop: usize,
+) -> io::Result<()> {
+    let visible_end = screen_left.saturating_add(width);
+    let mut display_column = 0;
+    let mut active_style = None;
+
+    for (source_offset, byte) in line.iter().copied().enumerate() {
+        let fragment = if byte == b'\t' {
+            vec![b' '; tabstop - (display_column % tabstop)]
+        } else if byte.is_ascii_control() {
+            vec![b'^', byte ^ 0x40]
+        } else {
+            vec![byte]
+        };
+        let fragment_end = display_column + fragment.len();
+        let visible_start = screen_left.max(display_column);
+        let visible_stop = visible_end.min(fragment_end);
+        if visible_start < visible_stop {
+            let style = highlighted_style_at(spans, line_start + source_offset);
+            if style != active_style {
+                if active_style.is_some() {
+                    write!(out, "\x1b[0m")?;
+                }
+                if let Some(style) = style {
+                    style.write_sgr(out)?;
+                }
+                active_style = style;
+            }
+            let start = visible_start - display_column;
+            let stop = visible_stop - display_column;
+            out.write_all(&fragment[start..stop])?;
+        }
+        display_column = fragment_end;
+        if display_column >= visible_end {
+            break;
+        }
+    }
+    if active_style.is_some() {
+        write!(out, "\x1b[0m")?;
+    }
+    Ok(())
+}
+
 fn find_pattern_before(text: &[u8], pattern: &[u8], before: usize) -> Option<usize> {
     (0..=before.min(text.len())).rfind(|start| match_pattern_at(text, *start, pattern, 0).is_some())
 }
@@ -2661,7 +2952,7 @@ type Captures = [Option<(usize, usize)>; 10];
 fn group_number(pattern: &[u8], at: usize) -> usize {
     pattern[..at]
         .windows(2)
-        .filter(|pair| *pair == [b'\\', b'('])
+        .filter(|pair| *pair == *b"\\(")
         .count()
         .saturating_add(1)
         .min(9)
@@ -3530,6 +3821,24 @@ mod terminal_event_tests {
             Some(0xc2)
         );
         assert_eq!(reader.pending.pop_front(), Some(0xac));
+    }
+
+    #[test]
+    fn syntax_spans_style_only_their_visible_byte_ranges() {
+        let spans = [HighlightSpan::new(
+            0,
+            3,
+            HighlightStyle::foreground(HighlightColor::Ansi(42)),
+        )];
+        let mut rendered = Vec::new();
+        write_highlighted_line(&mut rendered, b"let x", 0, &spans, 0, 80, 8)
+            .expect("render highlighted line");
+        assert_eq!(rendered, b"\x1b[38;5;42mlet\x1b[0m x");
+
+        rendered.clear();
+        write_highlighted_line(&mut rendered, b"let x", 0, &spans, 2, 2, 8)
+            .expect("render clipped highlighted line");
+        assert_eq!(rendered, b"\x1b[38;5;42mt\x1b[0m ");
     }
 }
 

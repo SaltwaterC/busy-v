@@ -1,6 +1,8 @@
-use busy_v::Editor;
+use busy_v::{Editor, HighlightColor, HighlightSpan, HighlightStyle};
+use std::cell::Cell;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 #[test]
 fn embedded_buffer_round_trips_newlines() {
@@ -8,6 +10,50 @@ fn embedded_buffer_round_trips_newlines() {
     assert_eq!(editor.bytes(), b"one\ntwo\n");
     let no_final_newline = Editor::from_bytes(b"one\ntwo", None, false);
     assert_eq!(no_final_newline.bytes(), b"one\ntwo");
+}
+
+#[test]
+fn embedding_can_supply_and_reuse_syntax_highlighting() {
+    let calls = Rc::new(Cell::new(0));
+    let observed = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let call_count = Rc::clone(&calls);
+    let seen_buffers = Rc::clone(&observed);
+    let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+
+    editor.set_syntax_highlighter(Box::new(move |buffer: &[u8]| {
+        call_count.set(call_count.get() + 1);
+        seen_buffers.borrow_mut().push(buffer.to_vec());
+        let first_line_end = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(buffer.len());
+        vec![HighlightSpan::new(
+            0,
+            first_line_end,
+            HighlightStyle::foreground(HighlightColor::Ansi(42)),
+        )]
+    }));
+
+    assert_eq!(editor.syntax_highlights().unwrap()[0].start, 0);
+    assert_eq!(calls.get(), 1);
+    assert_eq!(editor.syntax_highlights().unwrap()[0].end, 3);
+    assert_eq!(calls.get(), 1);
+
+    editor
+        .execute_keys(b"iX\x1b")
+        .expect("modify highlighted buffer");
+    assert_eq!(editor.syntax_highlights().unwrap()[0].end, 4);
+    assert_eq!(calls.get(), 2);
+    assert_eq!(
+        observed.borrow().as_slice(),
+        &[b"one\ntwo\n".to_vec(), b"Xone\ntwo\n".to_vec()]
+    );
+
+    editor.invalidate_syntax_highlighting();
+    let _ = editor.syntax_highlights();
+    assert_eq!(calls.get(), 3);
+    editor.clear_syntax_highlighter();
+    assert!(editor.syntax_highlights().is_none());
 }
 
 #[test]
