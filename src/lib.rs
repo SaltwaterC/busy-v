@@ -234,6 +234,17 @@ impl HighlightSpan {
 pub trait SyntaxHighlighter {
     fn highlight(&mut self, buffer: &[u8]) -> Vec<HighlightSpan>;
 
+    /// Return the optional `:set number` gutter styles.
+    ///
+    /// The default follows Vim's terminal `LineNr` and `CursorLineNr`
+    /// treatment: cyan line numbers and a bold cyan number for the current
+    /// line. The base editor does not use these styles unless a highlighter
+    /// is installed, and an embedding application can return `None` to leave
+    /// either form unstyled or supply colors from its own theme.
+    fn line_number_style(&self, current_line: bool) -> Option<HighlightStyle> {
+        Some(HighlightStyle::foreground(HighlightColor::Ansi(6)).with_bold(current_line))
+    }
+
     /// Return a completed asynchronous highlight update, if the embedding
     /// application performs parsing away from the editor's input path.
     ///
@@ -1458,6 +1469,23 @@ impl Editor {
         self.refresh_syntax_highlighting(false);
         let body = self.body_rows();
         let width = self.horizontal_width();
+        // Ask the embedding highlighter only once per frame. The optional
+        // styles preserve the plain `:set nu` gutter when no highlighter is
+        // installed, while allowing a syntax-aware editor to distinguish the
+        // current line as Vim does.
+        let (line_number_style, current_line_number_style) = if self.number {
+            self.syntax_highlighter
+                .as_ref()
+                .map(|highlighter| {
+                    (
+                        highlighter.line_number_style(false),
+                        highlighter.line_number_style(true),
+                    )
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
         // While an asynchronous highlighter is catching up, render the
         // current buffer plainly. This avoids both stale byte offsets and an
         // O(lines) offset rebuild on every typed character.
@@ -1472,13 +1500,19 @@ impl Editor {
                 frame.push(row);
                 continue;
             }
-            let prefix = if self.number {
-                let width = self.number_column_width().saturating_sub(1);
-                format!("{:>width$} ", index + 1, width = width).into_bytes()
-            } else {
-                Vec::new()
-            };
-            row.write_all(&prefix)?;
+            if self.number {
+                let style = if index == self.row {
+                    current_line_number_style
+                } else {
+                    line_number_style
+                };
+                write_line_number(
+                    &mut row,
+                    index + 1,
+                    self.number_column_width().saturating_sub(1),
+                    style,
+                )?;
+            }
             if syntax_enabled {
                 write_highlighted_line(
                     &mut row,
@@ -3220,6 +3254,23 @@ fn write_fragment<W: Write>(out: &mut W, byte: u8, start: usize, stop: usize) ->
     Ok(())
 }
 
+fn write_line_number<W: Write>(
+    out: &mut W,
+    line_number: usize,
+    width: usize,
+    style: Option<HighlightStyle>,
+) -> io::Result<()> {
+    let style = style.filter(|style| !style.is_plain());
+    if let Some(style) = style {
+        style.write_sgr(out)?;
+    }
+    write!(out, "{line_number:>width$} ")?;
+    if style.is_some() {
+        out.write_all(b"\x1b[0m")?;
+    }
+    Ok(())
+}
+
 fn write_plain_line<W: Write>(
     out: &mut W,
     line: &[u8],
@@ -4379,6 +4430,55 @@ mod terminal_event_tests {
         write_highlighted_line(&mut rendered, b"let x", 0, &mut highlights, 2, 2, 8)
             .expect("render clipped highlighted line");
         assert_eq!(rendered, b"\x1b[38;5;42mt\x1b[0m ");
+    }
+
+    #[test]
+    fn syntax_highlighter_styles_number_gutter_like_vim() {
+        struct Highlighter;
+
+        impl SyntaxHighlighter for Highlighter {
+            fn highlight(&mut self, _: &[u8]) -> Vec<HighlightSpan> {
+                Vec::new()
+            }
+        }
+
+        let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        editor.execute_ex("set nu");
+        editor.set_syntax_highlighter(Box::new(Highlighter));
+
+        let mut rendered = Vec::new();
+        editor
+            .render_to(&mut rendered, None)
+            .expect("render numbered syntax editor");
+
+        assert!(rendered
+            .windows(b"\x1b[1;38;5;6m  1 \x1b[0mone".len())
+            .any(|row| row == b"\x1b[1;38;5;6m  1 \x1b[0mone"));
+        assert!(rendered
+            .windows(b"\x1b[38;5;6m  2 \x1b[0mtwo".len())
+            .any(|row| row == b"\x1b[38;5;6m  2 \x1b[0mtwo"));
+    }
+
+    #[test]
+    fn number_gutter_stays_plain_without_syntax_highlighting() {
+        let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        editor.execute_ex("set nu");
+
+        let mut rendered = Vec::new();
+        editor
+            .render_to(&mut rendered, None)
+            .expect("render plain numbered editor");
+
+        assert!(rendered
+            .windows(b"  1 one".len())
+            .any(|row| row == b"  1 one"));
+        assert!(!rendered
+            .windows(b"\x1b[38;5;6m".len())
+            .any(|style| style == b"\x1b[38;5;6m"));
     }
 
     #[test]

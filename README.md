@@ -70,7 +70,8 @@ it makes porting far easier when the footprint after removing dead code is ~3klo
 ## Additional features
 
  * Native Windows and macOS support
- * :set number for line numbering
+ * :set number for line numbering including colouring when syntax higlight is
+   plugged in
  * Page Up/Down work as expected
 
 ## Build and test
