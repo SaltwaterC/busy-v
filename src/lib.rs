@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -232,6 +233,15 @@ impl HighlightSpan {
 /// state between calls if that is useful.
 pub trait SyntaxHighlighter {
     fn highlight(&mut self, buffer: &[u8]) -> Vec<HighlightSpan>;
+
+    /// Return a completed asynchronous highlight update, if the embedding
+    /// application performs parsing away from the editor's input path.
+    ///
+    /// The default preserves the synchronous callback behavior used by
+    /// existing embedders. Editors without a highlighter never call this.
+    fn poll(&mut self) -> Option<Vec<HighlightSpan>> {
+        None
+    }
 }
 
 impl<F> SyntaxHighlighter for F
@@ -242,6 +252,12 @@ where
         self(buffer)
     }
 }
+
+// Rebuilding a syntax tree can take much longer than processing a keystroke
+// for large files. Coalesce a burst of edits before asking an optional
+// highlighter for another snapshot. The highlighter can still be forced by
+// `Editor::syntax_highlights` for non-terminal embedders.
+const SYNTAX_HIGHLIGHT_DEBOUNCE: Duration = Duration::from_millis(75);
 
 struct Terminal {
     active: bool,
@@ -615,6 +631,7 @@ pub struct Editor {
     syntax_highlights: Vec<HighlightSpan>,
     syntax_line_offsets: Vec<usize>,
     syntax_highlights_dirty: bool,
+    syntax_highlight_ready_at: Option<Instant>,
 }
 
 impl Editor {
@@ -682,6 +699,7 @@ impl Editor {
             syntax_highlights: Vec::new(),
             syntax_line_offsets: Vec::new(),
             syntax_highlights_dirty: false,
+            syntax_highlight_ready_at: None,
         };
         editor.set_bytes(data);
         editor
@@ -783,10 +801,11 @@ impl Editor {
     /// parser state between redraws. Use [`Editor::clear_syntax_highlighter`]
     /// to return to the unstyled base renderer. A closure can be supplied
     /// directly because closures implementing `FnMut(&[u8]) -> Vec<HighlightSpan>`
-    /// implement [`SyntaxHighlighter`].
+    /// implement [`SyntaxHighlighter`]. Async highlighters can return their
+    /// completed work from [`SyntaxHighlighter::poll`] without stalling input.
     pub fn set_syntax_highlighter(&mut self, highlighter: Box<dyn SyntaxHighlighter>) {
         self.syntax_highlighter = Some(highlighter);
-        self.syntax_highlights_dirty = true;
+        self.mark_syntax_highlighting_dirty(false);
     }
 
     /// Remove the optional syntax highlighter and restore plain rendering.
@@ -795,22 +814,21 @@ impl Editor {
         self.syntax_highlights.clear();
         self.syntax_line_offsets.clear();
         self.syntax_highlights_dirty = false;
+        self.syntax_highlight_ready_at = None;
     }
 
     /// Tell the installed highlighter to recompute even when the buffer did
     /// not change, for example after the embedding application changes its
     /// theme or language selection.
     pub fn invalidate_syntax_highlighting(&mut self) {
-        if self.syntax_highlighter.is_some() {
-            self.syntax_highlights_dirty = true;
-        }
+        self.mark_syntax_highlighting_dirty(false);
     }
 
     /// Return the installed highlighter's current ranges in complete-buffer
     /// byte offsets. This lets a non-terminal embedding reuse the same
     /// host-provided highlighting data in its own renderer.
     pub fn syntax_highlights(&mut self) -> Option<&[HighlightSpan]> {
-        self.refresh_syntax_highlighting();
+        self.refresh_syntax_highlighting(true);
         self.syntax_highlighter
             .as_ref()
             .map(|_| self.syntax_highlights.as_slice())
@@ -856,21 +874,75 @@ impl Editor {
         self.col = 0;
         self.screen_top = 0;
         self.screen_left = 0;
-        self.syntax_highlights_dirty = self.syntax_highlighter.is_some();
+        self.mark_syntax_highlighting_dirty(false);
     }
 
-    fn refresh_syntax_highlighting(&mut self) {
-        if !self.syntax_highlights_dirty {
+    fn mark_syntax_highlighting_dirty(&mut self, defer: bool) {
+        if self.syntax_highlighter.is_none() {
             return;
         }
+
+        self.syntax_highlights_dirty = true;
+        self.syntax_highlight_ready_at = defer.then(|| Instant::now() + SYNTAX_HIGHLIGHT_DEBOUNCE);
+        // Old ranges describe pre-edit byte offsets. Render plain text while
+        // the optional highlighter catches up rather than applying stale
+        // colors at the wrong positions.
+        self.syntax_highlights.clear();
+        self.syntax_line_offsets.clear();
+    }
+
+    fn set_syntax_highlights(&mut self, highlights: Vec<HighlightSpan>) {
+        if highlights.is_empty() {
+            self.syntax_line_offsets.clear();
+        } else {
+            self.syntax_line_offsets = line_offsets(&self.lines);
+        }
+        self.syntax_highlights = highlights;
+    }
+
+    /// Poll completed background work and, when necessary, request a new
+    /// buffer snapshot. Returns whether a completed frame needs repainting.
+    fn refresh_syntax_highlighting(&mut self, force: bool) -> bool {
+        let mut updated = false;
+
+        // Do not apply a result while a newer buffer is waiting to be sent to
+        // the highlighter. Async implementations can otherwise briefly paint
+        // byte ranges from the previous document revision.
+        if !self.syntax_highlights_dirty {
+            if let Some(highlights) = self
+                .syntax_highlighter
+                .as_mut()
+                .and_then(|highlighter| highlighter.poll())
+            {
+                self.set_syntax_highlights(highlights);
+                updated = true;
+            }
+        }
+
+        if !self.syntax_highlights_dirty {
+            return updated;
+        }
+        if !force
+            && self
+                .syntax_highlight_ready_at
+                .is_some_and(|ready_at| Instant::now() < ready_at)
+        {
+            return updated;
+        }
+
+        // This copy is intentionally delayed for edits. A highlighter that
+        // parses on a worker thread receives one coalesced snapshot instead
+        // of one complete buffer per typed byte.
         let data = self.bytes();
-        self.syntax_line_offsets = line_offsets(&self.lines);
-        self.syntax_highlights = self
+        let highlights = self
             .syntax_highlighter
             .as_mut()
             .map(|highlighter| highlighter.highlight(&data))
             .unwrap_or_default();
+        self.set_syntax_highlights(highlights);
         self.syntax_highlights_dirty = false;
+        self.syntax_highlight_ready_at = None;
+        true
     }
 
     fn state(&self) -> EditorState {
@@ -942,7 +1014,7 @@ impl Editor {
         self.col = state.col.min(self.lines[self.row].len());
         self.trailing_newline = state.trailing_newline;
         self.modified = state.modified;
-        self.syntax_highlights_dirty = self.syntax_highlighter.is_some();
+        self.mark_syntax_highlighting_dirty(true);
     }
 
     fn begin_change(&mut self) {
@@ -963,7 +1035,7 @@ impl Editor {
             self.redo.clear();
         }
         self.modified = true;
-        self.syntax_highlights_dirty = self.syntax_highlighter.is_some();
+        self.mark_syntax_highlighting_dirty(true);
     }
 
     fn end_change(&mut self) {
@@ -1383,10 +1455,13 @@ impl Editor {
 
     fn render_to<W: Write>(&mut self, out: &mut W, prompt: Option<&str>) -> io::Result<()> {
         self.sync_screen();
-        self.refresh_syntax_highlighting();
+        self.refresh_syntax_highlighting(false);
         let body = self.body_rows();
         let width = self.horizontal_width();
-        let syntax_enabled = self.syntax_highlighter.is_some();
+        // While an asynchronous highlighter is catching up, render the
+        // current buffer plainly. This avoids both stale byte offsets and an
+        // O(lines) offset rebuild on every typed character.
+        let syntax_enabled = !self.syntax_highlights.is_empty();
         let mut highlight_cursor = HighlightCursor::new(&self.syntax_highlights);
         let mut frame = Vec::with_capacity(self.screen_rows);
         for screen_line in 0..body {
@@ -3050,7 +3125,8 @@ impl Editor {
         self.render(None)?;
         while !self.quit {
             let Some(key) = reader.try_key()? else {
-                if self.refresh_size() {
+                let syntax_updated = self.refresh_syntax_highlighting(false);
+                if self.refresh_size() || syntax_updated {
                     self.render(None)?;
                 }
                 continue;
@@ -4123,6 +4199,18 @@ fn startup_commands() -> (Vec<String>, Option<String>) {
 }
 
 pub fn run(arguments: Vec<String>) -> i32 {
+    run_with_editor_setup(arguments, |_| {})
+}
+
+/// Run vi after allowing an embedding application to configure each editor.
+///
+/// The callback is intentionally expressed only in terms of Editor. This
+/// keeps the vi core independent of parsers, grammars, and themes while still
+/// allowing a host application to install an optional SyntaxHighlighter.
+pub fn run_with_editor_setup(
+    arguments: Vec<String>,
+    mut setup_editor: impl FnMut(&mut Editor),
+) -> i32 {
     let mut readonly = false;
     let mut help = false;
     let mut commands = Vec::new();
@@ -4183,6 +4271,7 @@ pub fn run(arguments: Vec<String>) -> i32 {
                 return 1;
             }
         };
+        setup_editor(&mut editor);
         editor.set_file_context(file_index, files.len());
         if file_index == 0 {
             if let Some(error) = &startup_error {
@@ -4307,6 +4396,75 @@ mod terminal_event_tests {
 
         assert_eq!(highlights.index, 2);
         assert_eq!(rendered, b"\x1b[38;5;42mtwo\x1b[0m");
+    }
+
+    #[test]
+    fn syntax_highlighting_coalesces_edits_and_polls_async_results() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct AsyncHighlighter {
+            calls: Rc<Cell<usize>>,
+            ready: Rc<Cell<bool>>,
+            pending_length: Option<usize>,
+        }
+
+        impl SyntaxHighlighter for AsyncHighlighter {
+            fn highlight(&mut self, buffer: &[u8]) -> Vec<HighlightSpan> {
+                self.calls.set(self.calls.get() + 1);
+                self.pending_length = Some(buffer.len());
+                Vec::new()
+            }
+
+            fn poll(&mut self) -> Option<Vec<HighlightSpan>> {
+                self.ready
+                    .replace(false)
+                    .then(|| self.pending_length.take())
+                    .flatten()
+                    .map(|length| {
+                        vec![HighlightSpan::new(
+                            0,
+                            length.min(3),
+                            HighlightStyle::foreground(HighlightColor::Ansi(42)),
+                        )]
+                    })
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let ready = Rc::new(Cell::new(false));
+        let mut editor = Editor::from_bytes(b"one\n", None, false);
+        editor.set_syntax_highlighter(Box::new(AsyncHighlighter {
+            calls: Rc::clone(&calls),
+            ready: Rc::clone(&ready),
+            pending_length: None,
+        }));
+
+        let mut first_frame = Vec::new();
+        editor
+            .render_to(&mut first_frame, None)
+            .expect("schedule initial syntax work");
+        assert_eq!(calls.get(), 1);
+        assert!(editor.syntax_highlights.is_empty());
+
+        editor
+            .execute_keys(b"iXYZ\x1b")
+            .expect("edit while syntax work is pending");
+        let mut typing_frame = Vec::new();
+        editor
+            .render_to(&mut typing_frame, None)
+            .expect("render without reparsing every key");
+        assert_eq!(calls.get(), 1);
+        assert!(editor.syntax_highlights.is_empty());
+
+        editor.syntax_highlight_ready_at = Some(Instant::now() - SYNTAX_HIGHLIGHT_DEBOUNCE);
+        assert!(editor.refresh_syntax_highlighting(false));
+        assert_eq!(calls.get(), 2);
+
+        ready.set(true);
+        assert!(editor.refresh_syntax_highlighting(false));
+        assert_eq!(editor.syntax_highlights[0].end, 3);
+        assert_eq!(editor.syntax_line_offsets, vec![0]);
     }
 
     #[test]
