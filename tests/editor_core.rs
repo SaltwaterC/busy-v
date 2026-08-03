@@ -74,6 +74,28 @@ fn ex_substitute_and_delete_are_owned_operations() {
 }
 
 #[test]
+fn delta_undo_redo_covers_byte_and_structural_edits() {
+    let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+
+    editor.execute_keys(b"oadded\x1b").expect("open line");
+    assert_eq!(editor.bytes(), b"one\nadded\ntwo\n");
+    editor.execute_keys(b"u").expect("undo open line");
+    assert_eq!(editor.bytes(), b"one\ntwo\n");
+    editor.execute_keys(b"\x12").expect("redo open line");
+    assert_eq!(editor.bytes(), b"one\nadded\ntwo\n");
+
+    editor.execute_ex("%s/o/O/g");
+    assert_eq!(editor.bytes(), b"One\nadded\ntwO\n");
+    editor.execute_keys(b"u").expect("undo substitution");
+    assert_eq!(editor.bytes(), b"one\nadded\ntwo\n");
+
+    editor.execute_ex("2d");
+    assert_eq!(editor.bytes(), b"one\ntwo\n");
+    editor.execute_keys(b"u").expect("undo line deletion");
+    assert_eq!(editor.bytes(), b"one\nadded\ntwo\n");
+}
+
+#[test]
 fn reference_pattern_cases_work_through_editor_commands() {
     let mut editor = Editor::from_bytes(b"alpha beta\ncat cot cut\nfoo food\n", None, false);
     editor.execute_ex("1s/^a.*a$/<matched>/");

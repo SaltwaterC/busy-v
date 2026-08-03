@@ -4,8 +4,7 @@
 //! is intentionally byte-oriented (like the original BusyBox editor), while
 //! displaying non-UTF-8 input lossily at the terminal.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,13 +32,39 @@ const HELP: &str = "These features are available:\n\
 \tJob suspend and resume with ^Z\n\
 \tAdapt to window re-sizes\n";
 
-#[derive(Clone)]
-struct Snapshot {
-    lines: Vec<Vec<u8>>,
+#[derive(Clone, Copy)]
+struct EditorState {
     row: usize,
     col: usize,
     trailing_newline: bool,
     modified: bool,
+}
+
+#[derive(Clone)]
+enum Edit {
+    Bytes {
+        row: usize,
+        start: usize,
+        removed: Vec<u8>,
+        inserted: Vec<u8>,
+    },
+    Lines {
+        start: usize,
+        removed: Vec<Vec<u8>>,
+        inserted: Vec<Vec<u8>>,
+    },
+}
+
+#[derive(Clone)]
+struct Change {
+    edits: Vec<Edit>,
+    before: EditorState,
+    after: EditorState,
+}
+
+struct PendingChange {
+    edits: Vec<Edit>,
+    before: EditorState,
 }
 
 #[derive(Clone)]
@@ -143,34 +168,38 @@ impl HighlightStyle {
     }
 
     fn write_sgr<W: Write>(self, out: &mut W) -> io::Result<()> {
-        let mut codes = Vec::with_capacity(5);
+        write!(out, "\x1b[")?;
+        let mut separator = "";
         if self.bold {
-            codes.push("1".to_owned());
+            write!(out, "1")?;
+            separator = ";";
         }
         if self.italic {
-            codes.push("3".to_owned());
+            write!(out, "{separator}3")?;
+            separator = ";";
         }
         if self.underline {
-            codes.push("4".to_owned());
+            write!(out, "{separator}4")?;
+            separator = ";";
         }
         if let Some(color) = self.foreground {
-            codes.push(color.sgr_code(38));
+            color.write_sgr(out, separator, 38)?;
+            separator = ";";
         }
         if let Some(color) = self.background {
-            codes.push(color.sgr_code(48));
+            color.write_sgr(out, separator, 48)?;
         }
-        if codes.is_empty() {
-            return Ok(());
-        }
-        write!(out, "\x1b[{}m", codes.join(";"))
+        write!(out, "m")
     }
 }
 
 impl HighlightColor {
-    fn sgr_code(self, channel: u8) -> String {
+    fn write_sgr<W: Write>(self, out: &mut W, separator: &str, channel: u8) -> io::Result<()> {
         match self {
-            Self::Ansi(value) => format!("{channel};5;{value}"),
-            Self::Rgb { red, green, blue } => format!("{channel};2;{red};{green};{blue}"),
+            Self::Ansi(value) => write!(out, "{separator}{channel};5;{value}"),
+            Self::Rgb { red, green, blue } => {
+                write!(out, "{separator}{channel};2;{red};{green};{blue}")
+            }
         }
     }
 }
@@ -348,21 +377,7 @@ impl KeyReader {
                 return Ok(Some(0x1b));
             }
         };
-        let key = match final_byte {
-            b'A' => 0x80,
-            b'B' => 0x81,
-            b'C' => 0x82,
-            b'D' => 0x83,
-            b'H' => 0x84,
-            b'F' => 0x85,
-            b'~' if matches!(sequence.first(), Some(b'1') | Some(b'7')) => 0x84,
-            b'~' if matches!(sequence.first(), Some(b'4') | Some(b'8')) => 0x85,
-            b'~' if sequence.first() == Some(&b'2') => 0x86,
-            b'~' if sequence.first() == Some(&b'3') => 0x87,
-            b'~' if sequence.first() == Some(&b'5') => 0x88,
-            b'~' if sequence.first() == Some(&b'6') => 0x89,
-            _ => 0x1b,
-        };
+        let key = decode_escape_sequence(&sequence, final_byte);
         self.special = (0x80..=0x89).contains(&key);
         Ok(Some(key))
     }
@@ -384,12 +399,23 @@ impl KeyReader {
 
     fn try_event_key(&mut self, blocking: bool) -> io::Result<Option<u8>> {
         self.special = false;
+        if let Some(byte) = self.pending.pop_front() {
+            return Ok(Some(byte));
+        }
         loop {
             if !blocking && !event::poll(std::time::Duration::from_millis(50))? {
                 return Ok(None);
             }
             match event::read()? {
                 Event::Key(key) => {
+                    if key.code == KeyCode::Esc {
+                        return self.read_after_escape();
+                    }
+                    if let KeyCode::Char(prefix @ ('[' | 'O')) = key.code {
+                        if key.modifiers.contains(KeyModifiers::ALT) {
+                            return self.read_split_escape_sequence(prefix as u8);
+                        }
+                    }
                     if let Some(value) = self.push_event_key(key) {
                         return Ok(Some(value));
                     }
@@ -402,6 +428,53 @@ impl KeyReader {
                 _ => {}
             }
         }
+    }
+
+    fn read_after_escape(&mut self) -> io::Result<Option<u8>> {
+        if !event::poll(std::time::Duration::from_millis(50))? {
+            return Ok(Some(0x1b));
+        }
+        let Event::Key(key) = event::read()? else {
+            return Ok(Some(0x1b));
+        };
+        if key.kind == KeyEventKind::Release {
+            return Ok(Some(0x1b));
+        }
+        if let KeyCode::Char(prefix @ ('[' | 'O')) = key.code {
+            return self.read_split_escape_sequence(prefix as u8);
+        }
+        if let Some(value) = self.push_event_key(key) {
+            self.pending.push_back(value);
+        }
+        Ok(Some(0x1b))
+    }
+
+    fn read_split_escape_sequence(&mut self, prefix: u8) -> io::Result<Option<u8>> {
+        let mut sequence = Vec::new();
+        while sequence.len() < 32 && event::poll(std::time::Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let KeyCode::Char(character) = key.code else {
+                        break;
+                    };
+                    if !character.is_ascii() {
+                        break;
+                    }
+                    let byte = character as u8;
+                    sequence.push(byte);
+                    if (0x40..=0x7e).contains(&byte) {
+                        let key = decode_escape_sequence(&sequence, byte);
+                        self.special = (0x80..=0x89).contains(&key);
+                        return Ok(Some(key));
+                    }
+                }
+                Event::Resize(_, _) => break,
+                _ => {}
+            }
+        }
+        self.pending.push_back(prefix);
+        self.pending.extend(sequence);
+        Ok(Some(0x1b))
     }
 
     fn push_event_key(&mut self, key: KeyEvent) -> Option<u8> {
@@ -454,7 +527,12 @@ impl KeyReader {
             KeyCode::Tab => b'\t',
             KeyCode::Esc => 0x1b,
             KeyCode::Char(character) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && character.is_ascii() {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    let mut encoded = [0u8; 4];
+                    self.pending
+                        .extend(character.encode_utf8(&mut encoded).bytes());
+                    return Some(0x1b);
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) && character.is_ascii() {
                     (character.to_ascii_uppercase() as u8) & 0x1f
                 } else {
                     let mut encoded = [0u8; 4];
@@ -466,6 +544,24 @@ impl KeyReader {
             _ => return None,
         };
         Some(value)
+    }
+}
+
+fn decode_escape_sequence(sequence: &[u8], final_byte: u8) -> u8 {
+    match final_byte {
+        b'A' => 0x80,
+        b'B' => 0x81,
+        b'C' => 0x82,
+        b'D' => 0x83,
+        b'H' => 0x84,
+        b'F' => 0x85,
+        b'~' if matches!(sequence.first(), Some(b'1') | Some(b'7')) => 0x84,
+        b'~' if matches!(sequence.first(), Some(b'4') | Some(b'8')) => 0x85,
+        b'~' if sequence.first() == Some(&b'2') => 0x86,
+        b'~' if sequence.first() == Some(&b'3') => 0x87,
+        b'~' if sequence.first() == Some(&b'5') => 0x88,
+        b'~' if sequence.first() == Some(&b'6') => 0x89,
+        _ => 0x1b,
     }
 }
 
@@ -494,9 +590,9 @@ pub struct Editor {
     yank_linewise: bool,
     registers: HashMap<u8, Register>,
     selected_register: Option<u8>,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
-    change_open: bool,
+    undo: Vec<Change>,
+    redo: Vec<Change>,
+    pending_change: Option<PendingChange>,
     replaying: bool,
     last_change: Vec<u8>,
     search: Option<(Vec<u8>, i32)>,
@@ -513,8 +609,11 @@ pub struct Editor {
     screen_cols: usize,
     screen_top: usize,
     screen_left: usize,
+    rendered_rows: Vec<Vec<u8>>,
+    rendered_size: (usize, usize),
     syntax_highlighter: Option<Box<dyn SyntaxHighlighter>>,
     syntax_highlights: Vec<HighlightSpan>,
+    syntax_line_offsets: Vec<usize>,
     syntax_highlights_dirty: bool,
 }
 
@@ -560,7 +659,7 @@ impl Editor {
             selected_register: None,
             undo: Vec::new(),
             redo: Vec::new(),
-            change_open: false,
+            pending_change: None,
             replaying: false,
             last_change: Vec::new(),
             search: None,
@@ -576,9 +675,12 @@ impl Editor {
             screen_cols: 80,
             screen_top: 0,
             screen_left: 0,
+            rendered_rows: Vec::new(),
+            rendered_size: (0, 0),
             marks: [None; 26],
             syntax_highlighter: None,
             syntax_highlights: Vec::new(),
+            syntax_line_offsets: Vec::new(),
             syntax_highlights_dirty: false,
         };
         editor.set_bytes(data);
@@ -691,6 +793,7 @@ impl Editor {
     pub fn clear_syntax_highlighter(&mut self) {
         self.syntax_highlighter = None;
         self.syntax_highlights.clear();
+        self.syntax_line_offsets.clear();
         self.syntax_highlights_dirty = false;
     }
 
@@ -761,6 +864,7 @@ impl Editor {
             return;
         }
         let data = self.bytes();
+        self.syntax_line_offsets = line_offsets(&self.lines);
         self.syntax_highlights = self
             .syntax_highlighter
             .as_mut()
@@ -769,9 +873,8 @@ impl Editor {
         self.syntax_highlights_dirty = false;
     }
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            lines: self.lines.clone(),
+    fn state(&self) -> EditorState {
+        EditorState {
             row: self.row,
             col: self.col,
             trailing_newline: self.trailing_newline,
@@ -779,61 +882,209 @@ impl Editor {
         }
     }
 
-    fn undo_status(&self, previous: &Snapshot) -> String {
-        let before = snapshot_bytes(previous);
-        let after = self.bytes();
-        let prefix = before
-            .iter()
-            .zip(&after)
-            .take_while(|(left, right)| left == right)
-            .count();
-        let common_tail = before[prefix..]
-            .iter()
-            .rev()
-            .zip(after[prefix..].iter().rev())
-            .take_while(|(left, right)| left == right)
-            .count()
-            .min(before.len().saturating_sub(prefix))
-            .min(after.len().saturating_sub(prefix));
-        let before_changed = before.len().saturating_sub(prefix + common_tail);
-        let after_changed = after.len().saturating_sub(prefix + common_tail);
-        let (verb, chars) = if before_changed > after_changed {
-            ("restored", before_changed)
-        } else if after_changed > before_changed {
-            ("deleted", after_changed)
+    fn undo_status(&self, change: &Change) -> String {
+        let (removed, inserted, row, col) = change.edits.iter().fold(
+            (0, 0, usize::MAX, usize::MAX),
+            |(removed, inserted, first_row, first_col), edit| match edit {
+                Edit::Bytes {
+                    row,
+                    start,
+                    removed: old,
+                    inserted: new,
+                } => (
+                    removed + old.len(),
+                    inserted + new.len(),
+                    first_row.min(*row),
+                    if *row < first_row {
+                        *start
+                    } else if *row == first_row {
+                        first_col.min(*start)
+                    } else {
+                        first_col
+                    },
+                ),
+                Edit::Lines {
+                    start,
+                    removed: old,
+                    inserted: new,
+                } => (
+                    removed + serialized_lines_len(old),
+                    inserted + serialized_lines_len(new),
+                    first_row.min(*start),
+                    if *start < first_row { 0 } else { first_col },
+                ),
+            },
+        );
+        let (verb, chars) = if removed > inserted {
+            ("restored", removed)
+        } else if inserted > removed {
+            ("deleted", inserted)
         } else {
-            ("restored", before_changed.max(1))
+            ("restored", removed.max(1))
         };
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let position = self.lines[..row]
+            .iter()
+            .map(|line| line.len() + 1)
+            .sum::<usize>()
+            + col.min(self.lines[row].len());
         format!(
             "Undo [{}] {} {} chars at position {}",
             self.undo.len() + 1,
             verb,
             chars,
-            prefix
+            position
         )
     }
 
-    fn restore(&mut self, snapshot: Snapshot) {
-        self.lines = snapshot.lines;
-        self.row = snapshot.row.min(self.lines.len().saturating_sub(1));
-        self.col = snapshot.col.min(self.lines[self.row].len());
-        self.trailing_newline = snapshot.trailing_newline;
-        self.modified = snapshot.modified;
+    fn restore_state(&mut self, state: EditorState) {
+        self.row = state.row.min(self.lines.len().saturating_sub(1));
+        self.col = state.col.min(self.lines[self.row].len());
+        self.trailing_newline = state.trailing_newline;
+        self.modified = state.modified;
         self.syntax_highlights_dirty = self.syntax_highlighter.is_some();
     }
 
     fn begin_change(&mut self) {
-        if !self.change_open {
-            self.undo.push(self.snapshot());
+        if self.pending_change.is_none() {
+            self.pending_change = Some(PendingChange {
+                edits: Vec::new(),
+                before: self.state(),
+            });
+        }
+    }
+
+    fn changed(&mut self) {
+        if self
+            .pending_change
+            .as_ref()
+            .is_some_and(|change| change.edits.is_empty())
+        {
             self.redo.clear();
-            self.change_open = true;
         }
         self.modified = true;
         self.syntax_highlights_dirty = self.syntax_highlighter.is_some();
     }
 
     fn end_change(&mut self) {
-        self.change_open = false;
+        let Some(pending) = self.pending_change.take() else {
+            return;
+        };
+        if !pending.edits.is_empty() || pending.before.trailing_newline != self.trailing_newline {
+            self.undo.push(Change {
+                edits: pending.edits,
+                before: pending.before,
+                after: self.state(),
+            });
+        }
+    }
+
+    fn replace_bytes(
+        &mut self,
+        row: usize,
+        range: std::ops::Range<usize>,
+        inserted: impl Into<Vec<u8>>,
+    ) -> Vec<u8> {
+        let inserted = inserted.into();
+        let inserted_len = inserted.len();
+        let removed = self.lines[row][range.clone()].to_vec();
+        if removed == inserted {
+            return removed;
+        }
+        self.lines[row].splice(range.clone(), inserted.iter().copied());
+        self.changed();
+        let edits = &mut self
+            .pending_change
+            .as_mut()
+            .expect("replace_bytes requires begin_change")
+            .edits;
+        if let Some(Edit::Bytes {
+            row: previous_row,
+            start,
+            removed: previous_removed,
+            inserted: previous_inserted,
+        }) = edits.last_mut()
+        {
+            let contiguous = *previous_row == row
+                && range.start == *start + previous_inserted.len()
+                && ((previous_removed.is_empty() && removed.is_empty())
+                    || (previous_removed.len() == previous_inserted.len()
+                        && removed.len() == inserted_len));
+            if contiguous {
+                previous_removed.extend_from_slice(&removed);
+                previous_inserted.extend(inserted);
+                return removed;
+            }
+        }
+        edits.push(Edit::Bytes {
+            row,
+            start: range.start,
+            removed: removed.clone(),
+            inserted,
+        });
+        removed
+    }
+
+    fn replace_lines(
+        &mut self,
+        range: std::ops::Range<usize>,
+        inserted: Vec<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        let removed = self.lines[range.clone()].to_vec();
+        if removed == inserted {
+            return removed;
+        }
+        self.lines.splice(range.clone(), inserted.iter().cloned());
+        self.changed();
+        self.pending_change
+            .as_mut()
+            .expect("replace_lines requires begin_change")
+            .edits
+            .push(Edit::Lines {
+                start: range.start,
+                removed: removed.clone(),
+                inserted,
+            });
+        removed
+    }
+
+    fn apply_change(&mut self, change: &Change, forward: bool) {
+        let edits: Box<dyn Iterator<Item = &Edit>> = if forward {
+            Box::new(change.edits.iter())
+        } else {
+            Box::new(change.edits.iter().rev())
+        };
+        for edit in edits {
+            match edit {
+                Edit::Bytes {
+                    row,
+                    start,
+                    removed,
+                    inserted,
+                } => {
+                    let (old, new) = if forward {
+                        (removed, inserted)
+                    } else {
+                        (inserted, removed)
+                    };
+                    self.lines[*row].splice(*start..*start + old.len(), new.iter().copied());
+                }
+                Edit::Lines {
+                    start,
+                    removed,
+                    inserted,
+                } => {
+                    let (old, new) = if forward {
+                        (removed, inserted)
+                    } else {
+                        (inserted, removed)
+                    };
+                    self.lines
+                        .splice(*start..*start + old.len(), new.iter().cloned());
+                }
+            }
+        }
+        self.restore_state(if forward { change.after } else { change.before });
     }
 
     fn load_current(&mut self) -> io::Result<bool> {
@@ -848,7 +1099,7 @@ impl Editor {
                 self.clear_status();
             }
             Err(_) => {
-                self.lines = vec![Vec::new()];
+                self.set_bytes(&[]);
                 self.trailing_newline = true;
                 self.clear_status();
                 new_file = true;
@@ -1099,25 +1350,6 @@ impl Editor {
         }
     }
 
-    fn formatted_line(&self, line: &[u8]) -> Vec<u8> {
-        let mut formatted = Vec::new();
-        let mut width = 0;
-        for byte in String::from_utf8_lossy(line).bytes() {
-            if byte == b'\t' {
-                let count = self.tabstop - (width % self.tabstop);
-                formatted.extend(std::iter::repeat_n(b' ', count));
-                width += count;
-            } else if byte.is_ascii_control() {
-                formatted.extend([b'^', byte ^ 0x40]);
-                width += 2;
-            } else {
-                formatted.push(byte);
-                width += 1;
-            }
-        }
-        formatted
-    }
-
     fn edit_status(&self) -> String {
         let current = self.row + 1;
         let total = self.lines.len();
@@ -1145,19 +1377,24 @@ impl Editor {
     }
 
     fn render(&mut self, prompt: Option<&str>) -> io::Result<()> {
+        let mut out = io::stdout().lock();
+        self.render_to(&mut out, prompt)
+    }
+
+    fn render_to<W: Write>(&mut self, out: &mut W, prompt: Option<&str>) -> io::Result<()> {
         self.sync_screen();
         self.refresh_syntax_highlighting();
-        let mut out = io::stdout().lock();
-        write!(out, "\x1b[2J\x1b[H")?;
         let body = self.body_rows();
         let width = self.horizontal_width();
         let syntax_enabled = self.syntax_highlighter.is_some();
-        let line_offsets = line_offsets(&self.lines);
+        let mut highlight_cursor = HighlightCursor::new(&self.syntax_highlights);
+        let mut frame = Vec::with_capacity(self.screen_rows);
         for screen_line in 0..body {
             let index = self.screen_top + screen_line;
-            write!(out, "\x1b[{};1H", screen_line + 1)?;
+            let mut row = Vec::new();
             if index >= self.lines.len() {
-                write!(out, "~\x1b[K")?;
+                row.extend_from_slice(b"~\x1b[K");
+                frame.push(row);
                 continue;
             }
             let prefix = if self.number {
@@ -1166,38 +1403,43 @@ impl Editor {
             } else {
                 Vec::new()
             };
-            out.write_all(&prefix)?;
+            row.write_all(&prefix)?;
             if syntax_enabled {
                 write_highlighted_line(
-                    &mut out,
+                    &mut row,
                     &self.lines[index],
-                    line_offsets[index],
-                    &self.syntax_highlights,
+                    self.syntax_line_offsets[index],
+                    &mut highlight_cursor,
                     self.screen_left,
                     width,
                     self.tabstop,
                 )?;
             } else {
-                let formatted = self.formatted_line(&self.lines[index]);
-                let start = self.screen_left.min(formatted.len());
-                let end = start.saturating_add(width).min(formatted.len());
-                out.write_all(&formatted[start..end])?;
+                write_plain_line(
+                    &mut row,
+                    &self.lines[index],
+                    self.screen_left,
+                    width,
+                    self.tabstop,
+                )?;
             }
-            write!(out, "\x1b[K")?;
+            row.extend_from_slice(b"\x1b[K");
+            frame.push(row);
         }
-        write!(out, "\x1b[{};1H\x1b[K", self.screen_rows)?;
+        let mut status_row = Vec::new();
+        status_row.extend_from_slice(b"\x1b[K");
         if let Some(prompt) = prompt {
             let visible = prompt.chars().take(self.screen_cols.saturating_sub(1));
             for character in visible {
-                write!(out, "{}", character)?;
+                write!(status_row, "{}", character)?;
             }
         } else if !self.status.is_empty() {
             if self.status_highlighted {
-                write!(out, "\x1b[7m")?;
+                status_row.extend_from_slice(b"\x1b[7m");
             }
-            out.write_all(&self.status_bytes)?;
+            status_row.write_all(&self.status_bytes)?;
             if self.status_highlighted {
-                write!(out, "\x1b[m")?;
+                status_row.extend_from_slice(b"\x1b[m");
             }
         } else {
             for character in self
@@ -1205,9 +1447,25 @@ impl Editor {
                 .chars()
                 .take(self.screen_cols.saturating_sub(1))
             {
-                write!(out, "{}", character)?;
+                write!(status_row, "{}", character)?;
             }
         }
+        frame.push(status_row);
+
+        let size = (self.screen_rows, self.screen_cols);
+        let full_redraw = self.rendered_size != size || self.rendered_rows.len() != frame.len();
+        if full_redraw {
+            out.write_all(b"\x1b[2J\x1b[H")?;
+        }
+        for (index, row) in frame.iter().enumerate() {
+            if full_redraw || self.rendered_rows.get(index) != Some(row) {
+                write!(out, "\x1b[{};1H", index + 1)?;
+                out.write_all(row)?;
+            }
+        }
+        self.rendered_rows = frame;
+        self.rendered_size = size;
+
         let (cursor_row, cursor_col) = if let Some(prompt) = prompt {
             (
                 self.screen_rows,
@@ -1264,10 +1522,12 @@ impl Editor {
         if start <= end {
             self.yank = self.lines[start..=end].to_vec();
             self.yank_linewise = true;
-            self.lines.drain(start..=end);
-        }
-        if self.lines.is_empty() {
-            self.lines.push(Vec::new());
+            let replacement = if start == 0 && end + 1 == self.lines.len() {
+                vec![Vec::new()]
+            } else {
+                Vec::new()
+            };
+            self.replace_lines(start..end + 1, replacement);
         }
         self.row = start.min(self.lines.len() - 1);
         self.col = self.col.min(self.lines[self.row].len().saturating_sub(1));
@@ -1387,19 +1647,15 @@ impl Editor {
         self.begin_change();
         let at = if after { self.row + 1 } else { self.row };
         if self.yank_linewise {
-            for (offset, line) in self.yank.clone().into_iter().enumerate() {
-                self.lines.insert((at + offset).min(self.lines.len()), line);
-            }
+            let at = at.min(self.lines.len());
+            self.replace_lines(at..at, self.yank.clone());
             self.row = at.min(self.lines.len() - 1);
             self.col = 0;
         } else {
             let col = if after { self.col + 1 } else { self.col };
-            let line = &mut self.lines[self.row];
-            line.splice(
-                col.min(line.len())..col.min(line.len()),
-                self.yank[0].iter().copied(),
-            );
-            self.col = col.min(line.len().saturating_sub(1));
+            let col = col.min(self.lines[self.row].len());
+            self.replace_bytes(self.row, col..col, self.yank[0].clone());
+            self.col = col.min(self.lines[self.row].len().saturating_sub(1));
         }
         self.set_status(status);
     }
@@ -1826,10 +2082,9 @@ impl Editor {
                                     .map(|(_, end)| end.saturating_add(1))
                                     .unwrap_or(self.row + 1)
                             };
-                            for (i, line) in inserted.into_iter().enumerate() {
-                                self.lines.insert((at + i).min(self.lines.len()), line);
-                            }
-                            self.modified = true;
+                            let at = at.min(self.lines.len());
+                            self.begin_change();
+                            self.replace_lines(at..at, inserted);
                             let name = path.display().to_string();
                             self.set_status(format_file_status(&name, &data, false, self.readonly));
                         }
@@ -1931,20 +2186,22 @@ impl Editor {
         let will_change = self.lines[first_line..=final_line]
             .iter()
             .any(|line| replace_pattern_case(line, &old, &new, global, ignorecase).1 != 0);
-        if will_change {
-            self.begin_change();
+        if !will_change {
+            self.set_error("No match");
+            return;
         }
-        for line in &mut self.lines[first_line..=final_line] {
-            let (replacement, count) = replace_pattern_case(line, &old, &new, global, ignorecase);
+        self.begin_change();
+        for row in first_line..=final_line {
+            let (replacement, count) =
+                replace_pattern_case(&self.lines[row], &old, &new, global, ignorecase);
             if count != 0 {
-                *line = replacement;
+                let length = self.lines[row].len();
+                self.replace_bytes(row, 0..length, replacement);
                 changed += count;
                 changed_lines += 1;
             }
         }
-        if changed == 0 {
-            self.set_error("No match");
-        } else if changed > 1 {
+        if changed > 1 {
             self.set_status(format!(
                 "{} substitutions on {} lines",
                 changed, changed_lines
@@ -1953,6 +2210,9 @@ impl Editor {
     }
 
     fn handle_command(&mut self, reader: &mut KeyReader, key: u8) -> io::Result<()> {
+        if key == 0x1b {
+            return Ok(());
+        }
         if key == 3 {
             self.set_error("Interrupted");
             return Ok(());
@@ -2029,10 +2289,10 @@ impl Editor {
             return Ok(());
         }
         if key == b'u' {
-            if let Some(previous) = self.undo.pop() {
-                self.redo.push(self.snapshot());
-                let status = self.undo_status(&previous);
-                self.restore(previous);
+            if let Some(change) = self.undo.pop() {
+                self.apply_change(&change, false);
+                let status = self.undo_status(&change);
+                self.redo.push(change);
                 self.set_status(status);
             } else {
                 self.set_status("Already at oldest change");
@@ -2040,9 +2300,9 @@ impl Editor {
             return Ok(());
         }
         if key == 18 {
-            if let Some(next) = self.redo.pop() {
-                self.undo.push(self.snapshot());
-                self.restore(next);
+            if let Some(change) = self.redo.pop() {
+                self.apply_change(&change, true);
+                self.undo.push(change);
                 self.set_status("1 change redone");
             } else {
                 self.set_status("Already at newest change");
@@ -2119,7 +2379,8 @@ impl Editor {
             }
             b'C' => {
                 self.begin_change();
-                let removed = self.lines[self.row].split_off(self.col);
+                let removed =
+                    self.replace_bytes(self.row, self.col..self.lines[self.row].len(), Vec::new());
                 if !removed.is_empty() {
                     self.yank = vec![removed];
                     self.yank_linewise = false;
@@ -2132,7 +2393,8 @@ impl Editor {
             }
             b'S' => {
                 self.begin_change();
-                self.yank = vec![std::mem::take(&mut self.lines[self.row])];
+                let length = self.lines[self.row].len();
+                self.yank = vec![self.replace_bytes(self.row, 0..length, Vec::new())];
                 self.yank_linewise = true;
                 self.save_register(selected_register);
                 self.col = 0;
@@ -2143,12 +2405,11 @@ impl Editor {
             }
             b's' => {
                 self.begin_change();
-                let mut removed = Vec::new();
-                for _ in 0..count {
-                    if self.col < self.lines[self.row].len() {
-                        removed.push(self.lines[self.row].remove(self.col));
-                    }
-                }
+                let end = self
+                    .col
+                    .saturating_add(count)
+                    .min(self.lines[self.row].len());
+                let removed = self.replace_bytes(self.row, self.col..end, Vec::new());
                 if !removed.is_empty() {
                     self.yank = vec![removed];
                     self.yank_linewise = false;
@@ -2166,7 +2427,7 @@ impl Editor {
                 } else {
                     self.row
                 };
-                self.lines.insert(at, Vec::new());
+                self.replace_lines(at..at, vec![Vec::new()]);
                 self.row = at;
                 self.col = 0;
                 self.mode = Mode::Insert;
@@ -2179,11 +2440,17 @@ impl Editor {
                 if replacement != 0x1b && replacement.is_ascii() && !replacement.is_ascii_control()
                 {
                     self.begin_change();
-                    for _ in 0..count {
-                        if self.col < self.lines[self.row].len() {
-                            self.lines[self.row][self.col] = replacement;
-                            self.col += 1;
-                        }
+                    let end = self
+                        .col
+                        .saturating_add(count)
+                        .min(self.lines[self.row].len());
+                    if self.col < end {
+                        self.replace_bytes(
+                            self.row,
+                            self.col..end,
+                            vec![replacement; end - self.col],
+                        );
+                        self.col = end;
                     }
                     self.col = self.col.saturating_sub(1);
                     self.end_change();
@@ -2191,12 +2458,11 @@ impl Editor {
             }
             b'x' => {
                 self.begin_change();
-                let mut removed = Vec::new();
-                for _ in 0..count {
-                    if self.col < self.lines[self.row].len() {
-                        removed.push(self.lines[self.row].remove(self.col));
-                    }
-                }
+                let end = self
+                    .col
+                    .saturating_add(count)
+                    .min(self.lines[self.row].len());
+                let removed = self.replace_bytes(self.row, self.col..end, Vec::new());
                 if !removed.is_empty() {
                     self.yank = vec![removed];
                     self.yank_linewise = false;
@@ -2207,7 +2473,8 @@ impl Editor {
             }
             b'D' => {
                 self.begin_change();
-                let removed = self.lines[self.row].split_off(self.col);
+                let removed =
+                    self.replace_bytes(self.row, self.col..self.lines[self.row].len(), Vec::new());
                 if !removed.is_empty() {
                     self.yank = vec![removed];
                     self.yank_linewise = false;
@@ -2220,18 +2487,19 @@ impl Editor {
                 self.begin_change();
                 if self.col > 0 {
                     self.col -= 1;
-                    self.lines[self.row].remove(self.col);
+                    self.replace_bytes(self.row, self.col..self.col + 1, Vec::new());
                 }
                 self.end_change();
             }
             b'J' => {
                 self.begin_change();
                 if self.row + 1 < self.lines.len() {
-                    let next = self.lines.remove(self.row + 1);
-                    if !self.lines[self.row].is_empty() {
-                        self.lines[self.row].push(b' ');
+                    let mut joined = self.lines[self.row].clone();
+                    if !joined.is_empty() {
+                        joined.push(b' ');
                     }
-                    self.lines[self.row].extend(next);
+                    joined.extend_from_slice(&self.lines[self.row + 1]);
+                    self.replace_lines(self.row..self.row + 2, vec![joined]);
                 }
                 self.end_change();
             }
@@ -2250,11 +2518,16 @@ impl Editor {
             b'~' => {
                 self.begin_change();
                 for _ in 0..count {
-                    if let Some(byte) = self.lines[self.row].get_mut(self.col) {
-                        if byte.is_ascii_lowercase() {
-                            *byte = byte.to_ascii_uppercase();
+                    if let Some(&byte) = self.lines[self.row].get(self.col) {
+                        let replacement = if byte.is_ascii_lowercase() {
+                            byte.to_ascii_uppercase()
                         } else if byte.is_ascii_uppercase() {
-                            *byte = byte.to_ascii_lowercase();
+                            byte.to_ascii_lowercase()
+                        } else {
+                            byte
+                        };
+                        if replacement != byte {
+                            self.replace_bytes(self.row, self.col..self.col + 1, vec![replacement]);
                         }
                         self.col = (self.col + 1).min(self.lines[self.row].len().saturating_sub(1));
                     }
@@ -2266,7 +2539,8 @@ impl Editor {
                 if next == command {
                     self.begin_change();
                     let last = (self.row + count).min(self.lines.len());
-                    for line in &mut self.lines[self.row..last] {
+                    for row in self.row..last {
+                        let mut line = self.lines[row].clone();
                         if command == b'>' {
                             line.splice(0..0, *b"\t");
                         } else if line.first() == Some(&b'\t') {
@@ -2276,6 +2550,8 @@ impl Editor {
                             let remove = spaces.min(self.tabstop);
                             line.drain(..remove);
                         }
+                        let old_len = self.lines[row].len();
+                        self.replace_bytes(row, 0..old_len, line);
                     }
                     self.end_change();
                 }
@@ -2346,9 +2622,9 @@ impl Editor {
                 _ => {}
             },
             b'U' => {
-                if let Some(previous) = self.undo.pop() {
-                    self.redo.push(self.snapshot());
-                    self.restore(previous);
+                if let Some(change) = self.undo.pop() {
+                    self.apply_change(&change, false);
+                    self.redo.push(change);
                     let restored = self.lines.get(self.row).cloned().unwrap_or_default();
                     self.set_status(register_status("Undo", &[restored], true, 1, 'U'));
                 }
@@ -2519,7 +2795,7 @@ impl Editor {
             0x87 => {
                 self.begin_change();
                 if self.col < self.lines[self.row].len() {
-                    self.lines[self.row].remove(self.col);
+                    self.replace_bytes(self.row, self.col..self.col + 1, Vec::new());
                 }
                 self.end_change();
             }
@@ -2610,7 +2886,7 @@ impl Editor {
         if line_len > 0 && first < line_len {
             self.yank = vec![self.lines[row][first..=last.min(line_len - 1)].to_vec()];
             self.yank_linewise = false;
-            self.lines[row].drain(first..=last.min(line_len - 1));
+            self.replace_bytes(row, first..last.min(line_len - 1) + 1, Vec::new());
             self.set_status(register_status(
                 "Delete",
                 &self.yank,
@@ -2637,18 +2913,19 @@ impl Editor {
         }
         if key == 0x1b {
             self.mode = Mode::Command;
-            self.end_change();
             self.col = self
                 .col
                 .saturating_sub(1)
                 .min(self.lines[self.row].len().saturating_sub(1));
+            self.end_change();
             return Ok(());
         }
         if key == b'\r' || key == b'\n' {
             self.begin_change();
-            let rest = self.lines[self.row].split_off(self.col);
+            let current = self.lines[self.row].clone();
+            let rest = current[self.col..].to_vec();
             let indent = if self.autoindent {
-                self.lines[self.row]
+                current
                     .iter()
                     .take_while(|byte| **byte == b' ' || **byte == b'\t')
                     .copied()
@@ -2656,10 +2933,12 @@ impl Editor {
             } else {
                 Vec::new()
             };
+            let first_line = current[..self.col].to_vec();
+            let old_row = self.row;
             self.row += 1;
             let mut next_line = indent.clone();
             next_line.extend(rest);
-            self.lines.insert(self.row, next_line);
+            self.replace_lines(old_row..old_row + 1, vec![first_line, next_line]);
             self.col = indent.len();
             if !self.replaying {
                 self.last_change.push(key);
@@ -2670,12 +2949,14 @@ impl Editor {
             self.begin_change();
             if self.col > 0 {
                 self.col -= 1;
-                self.lines[self.row].remove(self.col);
+                self.replace_bytes(self.row, self.col..self.col + 1, Vec::new());
             } else if self.row > 0 {
-                let current = self.lines.remove(self.row);
+                let current = self.lines[self.row].clone();
                 self.row -= 1;
-                self.col = self.lines[self.row].len();
-                self.lines[self.row].extend(current);
+                let mut joined = self.lines[self.row].clone();
+                self.col = joined.len();
+                joined.extend(current);
+                self.replace_lines(self.row..self.row + 2, vec![joined]);
             }
             if !self.replaying {
                 self.last_change.push(key);
@@ -2715,7 +2996,7 @@ impl Editor {
         if special && key == 0x87 {
             self.begin_change();
             if self.col < self.lines[self.row].len() {
-                self.lines[self.row].remove(self.col);
+                self.replace_bytes(self.row, self.col..self.col + 1, Vec::new());
             }
             self.end_change();
             return Ok(());
@@ -2731,10 +3012,8 @@ impl Editor {
             self.begin_change();
             let width = self.line_display_width(&self.lines[self.row], self.col);
             let spaces = self.tabstop - (width % self.tabstop);
-            for _ in 0..spaces {
-                self.lines[self.row].insert(self.col, b' ');
-                self.col += 1;
-            }
+            self.replace_bytes(self.row, self.col..self.col, vec![b' '; spaces]);
+            self.col += spaces;
             if !self.replaying {
                 self.last_change.push(key);
             }
@@ -2744,9 +3023,9 @@ impl Editor {
             let byte = key;
             self.begin_change();
             if self.mode == Mode::Replace && self.col < self.lines[self.row].len() {
-                self.lines[self.row][self.col] = byte;
+                self.replace_bytes(self.row, self.col..self.col + 1, vec![byte]);
             } else {
-                self.lines[self.row].insert(self.col, byte);
+                self.replace_bytes(self.row, self.col..self.col, vec![byte]);
             }
             self.col += 1;
             if !self.replaying {
@@ -2810,19 +3089,97 @@ fn line_offsets(lines: &[Vec<u8>]) -> Vec<usize> {
     offsets
 }
 
-fn highlighted_style_at(spans: &[HighlightSpan], offset: usize) -> Option<HighlightStyle> {
-    spans
-        .iter()
-        .find(|span| span.start <= offset && offset < span.end)
-        .map(|span| span.style)
-        .filter(|style| !style.is_plain())
+struct HighlightCursor<'a> {
+    spans: &'a [HighlightSpan],
+    index: usize,
+}
+
+impl<'a> HighlightCursor<'a> {
+    fn new(spans: &'a [HighlightSpan]) -> Self {
+        Self { spans, index: 0 }
+    }
+
+    fn style_at(&mut self, offset: usize) -> Option<HighlightStyle> {
+        // HighlightSpan's sorted, non-overlapping contract means every span
+        // preceding the viewport or current byte only needs to be visited once.
+        while self
+            .spans
+            .get(self.index)
+            .is_some_and(|span| span.end <= offset)
+        {
+            self.index += 1;
+        }
+        self.spans
+            .get(self.index)
+            .filter(|span| span.start <= offset && offset < span.end)
+            .map(|span| span.style)
+            .filter(|style| !style.is_plain())
+    }
+}
+
+fn fragment_len(byte: u8, display_column: usize, tabstop: usize) -> usize {
+    if byte == b'\t' {
+        tabstop - (display_column % tabstop)
+    } else if byte.is_ascii_control() {
+        2
+    } else {
+        1
+    }
+}
+
+fn write_fragment<W: Write>(out: &mut W, byte: u8, start: usize, stop: usize) -> io::Result<()> {
+    if byte == b'\t' {
+        const SPACES: &[u8; 32] = b"                                ";
+        let mut remaining = stop - start;
+        while remaining > 0 {
+            let count = remaining.min(SPACES.len());
+            out.write_all(&SPACES[..count])?;
+            remaining -= count;
+        }
+    } else if byte.is_ascii_control() {
+        out.write_all(&[b'^', byte ^ 0x40][start..stop])?;
+    } else {
+        out.write_all(&[byte][start..stop])?;
+    }
+    Ok(())
+}
+
+fn write_plain_line<W: Write>(
+    out: &mut W,
+    line: &[u8],
+    screen_left: usize,
+    width: usize,
+    tabstop: usize,
+) -> io::Result<()> {
+    let visible_end = screen_left.saturating_add(width);
+    let mut display_column = 0;
+
+    for byte in line.iter().copied() {
+        let length = fragment_len(byte, display_column, tabstop);
+        let fragment_end = display_column + length;
+        let visible_start = screen_left.max(display_column);
+        let visible_stop = visible_end.min(fragment_end);
+        if visible_start < visible_stop {
+            write_fragment(
+                out,
+                byte,
+                visible_start - display_column,
+                visible_stop - display_column,
+            )?;
+        }
+        display_column = fragment_end;
+        if display_column >= visible_end {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn write_highlighted_line<W: Write>(
     out: &mut W,
     line: &[u8],
     line_start: usize,
-    spans: &[HighlightSpan],
+    highlights: &mut HighlightCursor<'_>,
     screen_left: usize,
     width: usize,
     tabstop: usize,
@@ -2832,18 +3189,12 @@ fn write_highlighted_line<W: Write>(
     let mut active_style = None;
 
     for (source_offset, byte) in line.iter().copied().enumerate() {
-        let fragment = if byte == b'\t' {
-            vec![b' '; tabstop - (display_column % tabstop)]
-        } else if byte.is_ascii_control() {
-            vec![b'^', byte ^ 0x40]
-        } else {
-            vec![byte]
-        };
-        let fragment_end = display_column + fragment.len();
+        let length = fragment_len(byte, display_column, tabstop);
+        let fragment_end = display_column + length;
         let visible_start = screen_left.max(display_column);
         let visible_stop = visible_end.min(fragment_end);
         if visible_start < visible_stop {
-            let style = highlighted_style_at(spans, line_start + source_offset);
+            let style = highlights.style_at(line_start + source_offset);
             if style != active_style {
                 if active_style.is_some() {
                     write!(out, "\x1b[0m")?;
@@ -2855,7 +3206,7 @@ fn write_highlighted_line<W: Write>(
             }
             let start = visible_start - display_column;
             let stop = visible_stop - display_column;
-            out.write_all(&fragment[start..stop])?;
+            write_fragment(out, byte, start, stop)?;
         }
         display_column = fragment_end;
         if display_column >= visible_end {
@@ -2869,7 +3220,10 @@ fn write_highlighted_line<W: Write>(
 }
 
 fn find_pattern_before(text: &[u8], pattern: &[u8], before: usize) -> Option<usize> {
-    (0..=before.min(text.len())).rfind(|start| match_pattern_at(text, *start, pattern, 0).is_some())
+    let mut context = MatchContext::new(pattern);
+    (0..=before.min(text.len())).rfind(|start| {
+        match_pattern_at_with_context(text, *start, pattern, 0, &mut context).is_some()
+    })
 }
 
 fn fold_ascii(bytes: &[u8]) -> Vec<u8> {
@@ -2949,6 +3303,30 @@ fn token_matches(token: &PatternToken, byte: u8) -> bool {
 
 type Captures = [Option<(usize, usize)>; 10];
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MatchState {
+    text_at: usize,
+    pattern_at: usize,
+    captures: Captures,
+    stack: Vec<usize>,
+}
+
+struct MatchContext {
+    failed: HashSet<MatchState>,
+    #[cfg(test)]
+    evaluated_states: usize,
+}
+
+impl MatchContext {
+    fn new(_pattern: &[u8]) -> Self {
+        Self {
+            failed: HashSet::new(),
+            #[cfg(test)]
+            evaluated_states: 0,
+        }
+    }
+}
+
 fn group_number(pattern: &[u8], at: usize) -> usize {
     pattern[..at]
         .windows(2)
@@ -2965,6 +3343,37 @@ fn match_pattern_captures(
     pattern_at: usize,
     captures: Captures,
     stack: Vec<usize>,
+    context: &mut MatchContext,
+) -> Option<(usize, Captures)> {
+    let state = MatchState {
+        text_at,
+        pattern_at,
+        captures,
+        stack: stack.clone(),
+    };
+    if context.failed.contains(&state) {
+        return None;
+    }
+    #[cfg(test)]
+    {
+        context.evaluated_states += 1;
+    }
+    let result =
+        match_pattern_captures_inner(text, text_at, pattern, pattern_at, captures, stack, context);
+    if result.is_none() {
+        context.failed.insert(state);
+    }
+    result
+}
+
+fn match_pattern_captures_inner(
+    text: &[u8],
+    text_at: usize,
+    pattern: &[u8],
+    pattern_at: usize,
+    captures: Captures,
+    stack: Vec<usize>,
+    context: &mut MatchContext,
 ) -> Option<(usize, Captures)> {
     if pattern_at >= pattern.len() {
         return Some((text_at, captures));
@@ -2975,7 +3384,15 @@ fn match_pattern_captures(
         let group = group_number(pattern, pattern_at);
         captures[group] = Some((text_at, text_at));
         stack.push(group);
-        return match_pattern_captures(text, text_at, pattern, pattern_at + 2, captures, stack);
+        return match_pattern_captures(
+            text,
+            text_at,
+            pattern,
+            pattern_at + 2,
+            captures,
+            stack,
+            context,
+        );
     }
     if pattern.get(pattern_at..pattern_at + 2) == Some(b"\\)") {
         let mut captures = captures;
@@ -2985,7 +3402,15 @@ fn match_pattern_captures(
                 captures[group] = Some((start, text_at));
             }
         }
-        return match_pattern_captures(text, text_at, pattern, pattern_at + 2, captures, stack);
+        return match_pattern_captures(
+            text,
+            text_at,
+            pattern,
+            pattern_at + 2,
+            captures,
+            stack,
+            context,
+        );
     }
     if pattern.get(pattern_at) == Some(&b'\\')
         && pattern
@@ -3003,13 +3428,22 @@ fn match_pattern_captures(
                 pattern_at + 2,
                 captures,
                 stack,
+                context,
             );
         }
         return None;
     }
     if pattern[pattern_at] == b'^' {
         return if text_at == 0 {
-            match_pattern_captures(text, text_at, pattern, pattern_at + 1, captures, stack)
+            match_pattern_captures(
+                text,
+                text_at,
+                pattern,
+                pattern_at + 1,
+                captures,
+                stack,
+                context,
+            )
         } else {
             None
         };
@@ -3019,42 +3453,51 @@ fn match_pattern_captures(
     }
     let (token, next) = pattern_token(pattern, pattern_at)?;
     if pattern.get(next) == Some(&b'*') {
-        let mut positions = vec![text_at];
-        let mut current = text_at;
-        while let Some(byte) = text.get(current) {
-            if !token_matches(&token, *byte) {
-                break;
-            }
-            current += 1;
-            positions.push(current);
-        }
-        for position in positions.into_iter().rev() {
-            if let Some(result) =
-                match_pattern_captures(text, position, pattern, next + 1, captures, stack.clone())
-            {
+        if text
+            .get(text_at)
+            .is_some_and(|byte| token_matches(&token, *byte))
+        {
+            if let Some(result) = match_pattern_captures(
+                text,
+                text_at + 1,
+                pattern,
+                pattern_at,
+                captures,
+                stack.clone(),
+                context,
+            ) {
                 return Some(result);
             }
         }
-        return None;
+        return match_pattern_captures(text, text_at, pattern, next + 1, captures, stack, context);
     }
     if text
         .get(text_at)
         .is_some_and(|byte| token_matches(&token, *byte))
     {
-        match_pattern_captures(text, text_at + 1, pattern, next, captures, stack)
+        match_pattern_captures(text, text_at + 1, pattern, next, captures, stack, context)
     } else {
         None
     }
 }
 
-fn match_pattern_at(
+fn match_pattern_at_with_context(
     text: &[u8],
     text_at: usize,
     pattern: &[u8],
     pattern_at: usize,
+    context: &mut MatchContext,
 ) -> Option<usize> {
-    match_pattern_captures(text, text_at, pattern, pattern_at, [None; 10], Vec::new())
-        .map(|(end, _)| end)
+    match_pattern_captures(
+        text,
+        text_at,
+        pattern,
+        pattern_at,
+        [None; 10],
+        Vec::new(),
+        context,
+    )
+    .map(|(end, _)| end)
 }
 
 fn find_pattern(text: &[u8], pattern: &[u8], from: usize) -> Option<usize> {
@@ -3068,7 +3511,10 @@ fn find_pattern(text: &[u8], pattern: &[u8], from: usize) -> Option<usize> {
     } else {
         from.min(end)..=end
     };
-    starts.find(|&start| match_pattern_at(text, start, pattern, 0).is_some())
+    let mut context = MatchContext::new(pattern);
+    starts.find(|&start| {
+        match_pattern_at_with_context(text, start, pattern, 0, &mut context).is_some()
+    })
 }
 
 fn replace_pattern_case(
@@ -3100,6 +3546,7 @@ fn replace_pattern_case(
             output.extend_from_slice(&line[source_at..]);
             break;
         };
+        let mut context = MatchContext::new(pattern_for_matching);
         let Some((end, captures)) = match_pattern_captures(
             line_for_matching,
             start,
@@ -3107,6 +3554,7 @@ fn replace_pattern_case(
             0,
             [None; 10],
             Vec::new(),
+            &mut context,
         ) else {
             break;
         };
@@ -3312,15 +3760,8 @@ fn line_count(data: &[u8]) -> usize {
     }
 }
 
-fn snapshot_bytes(snapshot: &Snapshot) -> Vec<u8> {
-    let mut data = Vec::new();
-    for (index, line) in snapshot.lines.iter().enumerate() {
-        data.extend_from_slice(line);
-        if index + 1 < snapshot.lines.len() || snapshot.trailing_newline {
-            data.push(b'\n');
-        }
-    }
-    data
+fn serialized_lines_len(lines: &[Vec<u8>]) -> usize {
+    lines.iter().map(|line| line.len() + 1).sum()
 }
 
 fn format_file_status(name: &str, data: &[u8], new_file: bool, readonly: bool) -> String {
@@ -3821,6 +4262,14 @@ mod terminal_event_tests {
             Some(0xc2)
         );
         assert_eq!(reader.pending.pop_front(), Some(0xac));
+
+        assert_eq!(
+            reader.push_event_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::ALT)),
+            Some(0x1b)
+        );
+        assert_eq!(reader.pending.pop_front(), Some(b':'));
+        assert_eq!(decode_escape_sequence(b"C", b'C'), 0x82);
+        assert_eq!(decode_escape_sequence(b"6~", b'~'), 0x89);
     }
 
     #[test]
@@ -3831,14 +4280,110 @@ mod terminal_event_tests {
             HighlightStyle::foreground(HighlightColor::Ansi(42)),
         )];
         let mut rendered = Vec::new();
-        write_highlighted_line(&mut rendered, b"let x", 0, &spans, 0, 80, 8)
+        let mut highlights = HighlightCursor::new(&spans);
+        write_highlighted_line(&mut rendered, b"let x", 0, &mut highlights, 0, 80, 8)
             .expect("render highlighted line");
         assert_eq!(rendered, b"\x1b[38;5;42mlet\x1b[0m x");
 
         rendered.clear();
-        write_highlighted_line(&mut rendered, b"let x", 0, &spans, 2, 2, 8)
+        highlights = HighlightCursor::new(&spans);
+        write_highlighted_line(&mut rendered, b"let x", 0, &mut highlights, 2, 2, 8)
             .expect("render clipped highlighted line");
         assert_eq!(rendered, b"\x1b[38;5;42mt\x1b[0m ");
+    }
+
+    #[test]
+    fn syntax_span_cursor_advances_across_lines() {
+        let style = HighlightStyle::foreground(HighlightColor::Ansi(42));
+        let spans = [
+            HighlightSpan::new(0, 3, style),
+            HighlightSpan::new(4, 7, style),
+            HighlightSpan::new(8, 11, style),
+        ];
+        let mut rendered = Vec::new();
+        let mut highlights = HighlightCursor::new(&spans);
+        write_highlighted_line(&mut rendered, b"two", 8, &mut highlights, 0, 80, 8)
+            .expect("render line after preceding spans");
+
+        assert_eq!(highlights.index, 2);
+        assert_eq!(rendered, b"\x1b[38;5;42mtwo\x1b[0m");
+    }
+
+    #[test]
+    fn plain_line_rendering_stops_at_the_visible_columns() {
+        let mut rendered = Vec::new();
+        write_plain_line(&mut rendered, b"ab\tcd\x01ignored", 1, 5, 4)
+            .expect("render clipped plain line");
+
+        assert_eq!(rendered, b"b  cd");
+    }
+
+    #[test]
+    fn unchanged_frames_only_emit_cursor_positioning() {
+        let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        let mut first = Vec::new();
+        editor.render_to(&mut first, None).expect("first frame");
+        assert!(first.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+
+        let mut second = Vec::new();
+        editor
+            .render_to(&mut second, None)
+            .expect("unchanged frame");
+        assert!(!second.windows(3).any(|bytes| bytes == b"\x1b[K"));
+        assert!(second.starts_with(b"\x1b[?25h"));
+
+        editor.execute_keys(b"l").expect("move cursor");
+        let mut moved = Vec::new();
+        editor
+            .render_to(&mut moved, None)
+            .expect("cursor-only frame");
+        assert!(!moved.windows(3).any(|bytes| bytes == b"\x1b[K"));
+
+        editor.execute_keys(b"x").expect("change first row");
+        let mut changed = Vec::new();
+        editor.render_to(&mut changed, None).expect("changed frame");
+        assert!(changed.windows(6).any(|bytes| bytes == b"\x1b[1;1H"));
+        assert!(!changed.windows(6).any(|bytes| bytes == b"\x1b[2;1H"));
+    }
+
+    #[test]
+    fn failed_star_matches_evaluate_each_state_once() {
+        let text = vec![b'a'; 64];
+        let pattern = b"^a*a*a*a*a*a*a*a*b$";
+        let mut context = MatchContext::new(pattern);
+        let matched =
+            match_pattern_captures(&text, 0, pattern, 0, [None; 10], Vec::new(), &mut context);
+
+        assert!(matched.is_none());
+        assert!(context.evaluated_states <= (text.len() + 1) * (pattern.len() + 1));
+    }
+
+    #[test]
+    fn undo_journal_stores_only_changed_bytes() {
+        let mut data = vec![b'a'; 1_000_000];
+        data.push(b'\n');
+        let mut editor = Editor::from_bytes(&data, None, false);
+        editor
+            .execute_keys(b"Axyz\x1b")
+            .expect("append to large buffer");
+
+        assert_eq!(editor.undo.len(), 1);
+        assert_eq!(editor.undo[0].edits.len(), 1);
+        let Edit::Bytes {
+            removed, inserted, ..
+        } = &editor.undo[0].edits[0]
+        else {
+            panic!("append should create a byte edit");
+        };
+        assert!(removed.is_empty());
+        assert_eq!(inserted, b"xyz");
+
+        editor.execute_keys(b"u").expect("undo append");
+        assert_eq!(editor.bytes(), data);
+        editor.execute_keys(b"\x12").expect("redo append");
+        assert!(editor.bytes().ends_with(b"xyz\n"));
     }
 }
 
