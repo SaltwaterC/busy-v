@@ -253,6 +253,15 @@ pub trait SyntaxHighlighter {
     fn poll(&mut self) -> Option<Vec<HighlightSpan>> {
         None
     }
+
+    /// Whether [`SyntaxHighlighter::highlight`] has work in flight.
+    ///
+    /// Asynchronous highlighters can return their existing ranges from
+    /// `highlight` while a newer snapshot is being parsed. The editor then
+    /// keeps those ranges visible until `poll` returns the replacement.
+    fn has_pending_work(&self) -> bool {
+        false
+    }
 }
 
 impl<F> SyntaxHighlighter for F
@@ -641,8 +650,10 @@ pub struct Editor {
     syntax_highlighter: Option<Box<dyn SyntaxHighlighter>>,
     syntax_highlights: Vec<HighlightSpan>,
     syntax_line_offsets: Vec<usize>,
+    syntax_line_offset_shifts: Vec<(usize, isize)>,
     syntax_highlights_dirty: bool,
     syntax_highlight_ready_at: Option<Instant>,
+    syntax_highlight_request_pending: bool,
 }
 
 impl Editor {
@@ -709,8 +720,10 @@ impl Editor {
             syntax_highlighter: None,
             syntax_highlights: Vec::new(),
             syntax_line_offsets: Vec::new(),
+            syntax_line_offset_shifts: Vec::new(),
             syntax_highlights_dirty: false,
             syntax_highlight_ready_at: None,
+            syntax_highlight_request_pending: false,
         };
         editor.set_bytes(data);
         editor
@@ -816,6 +829,10 @@ impl Editor {
     /// completed work from [`SyntaxHighlighter::poll`] without stalling input.
     pub fn set_syntax_highlighter(&mut self, highlighter: Box<dyn SyntaxHighlighter>) {
         self.syntax_highlighter = Some(highlighter);
+        self.syntax_highlights.clear();
+        self.syntax_line_offsets.clear();
+        self.syntax_line_offset_shifts.clear();
+        self.syntax_highlight_request_pending = false;
         self.mark_syntax_highlighting_dirty(false);
     }
 
@@ -824,8 +841,10 @@ impl Editor {
         self.syntax_highlighter = None;
         self.syntax_highlights.clear();
         self.syntax_line_offsets.clear();
+        self.syntax_line_offset_shifts.clear();
         self.syntax_highlights_dirty = false;
         self.syntax_highlight_ready_at = None;
+        self.syntax_highlight_request_pending = false;
     }
 
     /// Tell the installed highlighter to recompute even when the buffer did
@@ -833,6 +852,10 @@ impl Editor {
     /// theme or language selection.
     pub fn invalidate_syntax_highlighting(&mut self) {
         self.mark_syntax_highlighting_dirty(false);
+        self.syntax_highlights.clear();
+        self.syntax_line_offsets.clear();
+        self.syntax_line_offset_shifts.clear();
+        self.syntax_highlight_request_pending = false;
     }
 
     /// Return the installed highlighter's current ranges in complete-buffer
@@ -886,6 +909,10 @@ impl Editor {
         self.screen_top = 0;
         self.screen_left = 0;
         self.mark_syntax_highlighting_dirty(false);
+        self.syntax_highlights.clear();
+        self.syntax_line_offsets.clear();
+        self.syntax_line_offset_shifts.clear();
+        self.syntax_highlight_request_pending = false;
     }
 
     fn mark_syntax_highlighting_dirty(&mut self, defer: bool) {
@@ -895,20 +922,75 @@ impl Editor {
 
         self.syntax_highlights_dirty = true;
         self.syntax_highlight_ready_at = defer.then(|| Instant::now() + SYNTAX_HIGHLIGHT_DEBOUNCE);
-        // Old ranges describe pre-edit byte offsets. Render plain text while
-        // the optional highlighter catches up rather than applying stale
-        // colors at the wrong positions.
-        self.syntax_highlights.clear();
-        self.syntax_line_offsets.clear();
+        // Keep the previous ranges visible while the optional highlighter
+        // catches up. Editing operations adjust their byte offsets below, so
+        // unrelated rows do not flash back to plain text on every keypress.
     }
 
     fn set_syntax_highlights(&mut self, highlights: Vec<HighlightSpan>) {
         if highlights.is_empty() {
             self.syntax_line_offsets.clear();
+            self.syntax_line_offset_shifts.clear();
         } else {
             self.syntax_line_offsets = line_offsets(&self.lines);
+            self.syntax_line_offset_shifts.clear();
         }
         self.syntax_highlights = highlights;
+    }
+
+    fn syntax_line_offset(&self, line: usize) -> usize {
+        let offset = self.syntax_line_offsets[line];
+        let adjustment = self
+            .syntax_line_offset_shifts
+            .iter()
+            .filter(|(first_line, _)| *first_line <= line)
+            .map(|(_, delta)| *delta)
+            .sum();
+        shift_offset(offset, adjustment)
+    }
+
+    fn adjust_syntax_highlights_for_edit(
+        &mut self,
+        start: usize,
+        removed_len: usize,
+        inserted_len: usize,
+    ) {
+        if self.syntax_highlights.is_empty() {
+            return;
+        }
+
+        let removed_end = start.saturating_add(removed_len);
+        let delta = inserted_len as isize - removed_len as isize;
+        let mut adjusted = Vec::with_capacity(self.syntax_highlights.len());
+        for span in self.syntax_highlights.drain(..) {
+            if span.end <= start {
+                adjusted.push(span);
+            } else if span.start >= removed_end {
+                adjusted.push(HighlightSpan::new(
+                    shift_offset(span.start, delta),
+                    shift_offset(span.end, delta),
+                    span.style,
+                ));
+            } else {
+                // Keep only the portions that are known to remain valid. The
+                // changed bytes stay unstyled until the next parse completes.
+                if span.start < start {
+                    adjusted.push(HighlightSpan::new(span.start, start, span.style));
+                }
+                if span.end > removed_end {
+                    adjusted.push(HighlightSpan::new(
+                        start.saturating_add(inserted_len),
+                        shift_offset(span.end, delta),
+                        span.style,
+                    ));
+                }
+            }
+        }
+        self.syntax_highlights = adjusted;
+        if self.syntax_highlights.is_empty() {
+            self.syntax_line_offsets.clear();
+            self.syntax_line_offset_shifts.clear();
+        }
     }
 
     /// Poll completed background work and, when necessary, request a new
@@ -919,18 +1001,26 @@ impl Editor {
         // Do not apply a result while a newer buffer is waiting to be sent to
         // the highlighter. Async implementations can otherwise briefly paint
         // byte ranges from the previous document revision.
+        let completed = self
+            .syntax_highlighter
+            .as_mut()
+            .and_then(|highlighter| highlighter.poll());
+        let pending_after_poll = self
+            .syntax_highlighter
+            .as_ref()
+            .is_some_and(|highlighter| highlighter.has_pending_work());
+        self.syntax_highlight_request_pending = pending_after_poll;
         if !self.syntax_highlights_dirty {
-            if let Some(highlights) = self
-                .syntax_highlighter
-                .as_mut()
-                .and_then(|highlighter| highlighter.poll())
-            {
+            if let Some(highlights) = completed {
                 self.set_syntax_highlights(highlights);
                 updated = true;
             }
         }
 
         if !self.syntax_highlights_dirty {
+            return updated;
+        }
+        if self.syntax_highlight_request_pending && !force {
             return updated;
         }
         if !force
@@ -945,15 +1035,21 @@ impl Editor {
         // parses on a worker thread receives one coalesced snapshot instead
         // of one complete buffer per typed byte.
         let data = self.bytes();
-        let highlights = self
+        let (highlights, pending) = self
             .syntax_highlighter
             .as_mut()
-            .map(|highlighter| highlighter.highlight(&data))
+            .map(|highlighter| {
+                let highlights = highlighter.highlight(&data);
+                (highlights, highlighter.has_pending_work())
+            })
             .unwrap_or_default();
-        self.set_syntax_highlights(highlights);
+        self.syntax_highlight_request_pending = pending;
+        if !pending {
+            self.set_syntax_highlights(highlights);
+        }
         self.syntax_highlights_dirty = false;
         self.syntax_highlight_ready_at = None;
-        true
+        updated || !pending
     }
 
     fn state(&self) -> EditorState {
@@ -1026,6 +1122,10 @@ impl Editor {
         self.trailing_newline = state.trailing_newline;
         self.modified = state.modified;
         self.mark_syntax_highlighting_dirty(true);
+        self.syntax_highlights.clear();
+        self.syntax_line_offsets.clear();
+        self.syntax_line_offset_shifts.clear();
+        self.syntax_highlight_request_pending = false;
     }
 
     fn begin_change(&mut self) {
@@ -1074,6 +1174,18 @@ impl Editor {
         if removed == inserted {
             return removed;
         }
+        if !self.syntax_highlights.is_empty() {
+            let line_start = self.syntax_line_offset(row);
+            self.adjust_syntax_highlights_for_edit(
+                line_start.saturating_add(range.start),
+                removed.len(),
+                inserted_len,
+            );
+            let delta = inserted_len as isize - removed.len() as isize;
+            if delta != 0 {
+                self.syntax_line_offset_shifts.push((row + 1, delta));
+            }
+        }
         self.lines[row].splice(range.clone(), inserted.iter().copied());
         self.changed();
         let edits = &mut self
@@ -1117,7 +1229,23 @@ impl Editor {
         if removed == inserted {
             return removed;
         }
+        if !self.syntax_highlights.is_empty() {
+            let start = self
+                .syntax_line_offsets
+                .get(range.start)
+                .map(|_| self.syntax_line_offset(range.start))
+                .unwrap_or_else(|| serialized_lines_len(&self.lines));
+            self.adjust_syntax_highlights_for_edit(
+                start,
+                serialized_lines_len(&removed),
+                serialized_lines_len(&inserted),
+            );
+        }
         self.lines.splice(range.clone(), inserted.iter().cloned());
+        if !self.syntax_highlights.is_empty() {
+            self.syntax_line_offsets = line_offsets(&self.lines);
+            self.syntax_line_offset_shifts.clear();
+        }
         self.changed();
         self.pending_change
             .as_mut()
@@ -1517,7 +1645,7 @@ impl Editor {
                 write_highlighted_line(
                     &mut row,
                     &self.lines[index],
-                    self.syntax_line_offsets[index],
+                    self.syntax_line_offset(index),
                     &mut highlight_cursor,
                     self.screen_left,
                     width,
@@ -3199,6 +3327,14 @@ fn line_offsets(lines: &[Vec<u8>]) -> Vec<usize> {
     offsets
 }
 
+fn shift_offset(offset: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        offset.saturating_add(delta as usize)
+    } else {
+        offset.saturating_sub(delta.unsigned_abs())
+    }
+}
+
 struct HighlightCursor<'a> {
     spans: &'a [HighlightSpan],
     index: usize,
@@ -4590,6 +4726,55 @@ mod terminal_event_tests {
         assert!(editor.refresh_syntax_highlighting(false));
         assert_eq!(editor.syntax_highlights[0].end, 3);
         assert_eq!(editor.syntax_line_offsets, vec![0]);
+    }
+
+    #[test]
+    fn syntax_highlighting_keeps_unrelated_rows_styled_while_typing() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Highlighter {
+            calls: Rc<Cell<usize>>,
+        }
+
+        impl SyntaxHighlighter for Highlighter {
+            fn highlight(&mut self, _: &[u8]) -> Vec<HighlightSpan> {
+                self.calls.set(self.calls.get() + 1);
+                vec![HighlightSpan::new(
+                    8,
+                    13,
+                    HighlightStyle::foreground(HighlightColor::Ansi(42)),
+                )]
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let mut editor = Editor::from_bytes(b"one\ntwo\nthree\n", None, false);
+        editor.set_syntax_highlighter(Box::new(Highlighter {
+            calls: Rc::clone(&calls),
+        }));
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+
+        let mut initial = Vec::new();
+        editor
+            .render_to(&mut initial, None)
+            .expect("render initial syntax highlighting");
+        assert_eq!(calls.get(), 1);
+
+        editor.execute_keys(b"iX\x1b").expect("edit the first line");
+        let mut typing = Vec::new();
+        editor
+            .render_to(&mut typing, None)
+            .expect("render while syntax highlighting is deferred");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(editor.syntax_highlights[0].start, 9);
+        assert_eq!(
+            editor.rendered_rows[2],
+            b"\x1b[38;5;42mthree\x1b[0m\x1b[K".to_vec()
+        );
+        assert!(!typing.windows(b"three".len()).any(|row| row == b"three"));
     }
 
     #[test]
