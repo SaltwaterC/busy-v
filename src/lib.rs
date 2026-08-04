@@ -1569,7 +1569,7 @@ impl Editor {
         for (index, row) in frame.iter().enumerate() {
             if full_redraw || self.rendered_rows.get(index) != Some(row) {
                 write!(out, "\x1b[{};1H", index + 1)?;
-                out.write_all(row)?;
+                write_rendered_row(out, row)?;
             }
         }
         self.rendered_rows = frame;
@@ -3254,6 +3254,21 @@ fn write_fragment<W: Write>(out: &mut W, byte: u8, start: usize, stop: usize) ->
     Ok(())
 }
 
+// Rust writes to a legacy Windows console through UTF-16 and rejects malformed
+// UTF-8. A byte-oriented buffer can be clipped in the middle of a Unicode
+// scalar before its ANSI erase sequence is appended, so make the final frame
+// write valid UTF-8 only for that console path.
+#[cfg(windows)]
+fn write_rendered_row<W: Write>(out: &mut W, row: &[u8]) -> io::Result<()> {
+    let row = String::from_utf8_lossy(row);
+    out.write_all(row.as_bytes())
+}
+
+#[cfg(not(windows))]
+fn write_rendered_row<W: Write>(out: &mut W, row: &[u8]) -> io::Result<()> {
+    out.write_all(row)
+}
+
 fn write_line_number<W: Write>(
     out: &mut W,
     line_number: usize,
@@ -4430,6 +4445,16 @@ mod terminal_event_tests {
         write_highlighted_line(&mut rendered, b"let x", 0, &mut highlights, 2, 2, 8)
             .expect("render clipped highlighted line");
         assert_eq!(rendered, b"\x1b[38;5;42mt\x1b[0m ");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_console_rows_replace_a_clipped_unicode_sequence() {
+        let mut rendered = Vec::new();
+        write_rendered_row(&mut rendered, b"\x1b[1;1H\xe2\x9d")
+            .expect("render a clipped unicode row");
+
+        assert_eq!(rendered, b"\x1b[1;1H\xef\xbf\xbd");
     }
 
     #[test]
