@@ -251,6 +251,10 @@ pub trait SyntaxHighlighter {
         None
     }
 
+    /// Invalidate any state retained by [`Self::highlight_visible`] after a
+    /// buffer edit or an embedding-side syntax change.
+    fn invalidate_visible(&mut self) {}
+
     /// Return the optional `:set number` gutter styles.
     ///
     /// The default follows Vim's terminal `LineNr` and `CursorLineNr`
@@ -666,12 +670,15 @@ pub struct Editor {
     rendered_size: (usize, usize),
     syntax_highlighter: Option<Box<dyn SyntaxHighlighter>>,
     syntax_highlights: Vec<HighlightSpan>,
+    syntax_preview_highlights: Vec<HighlightSpan>,
     syntax_line_offsets: Vec<usize>,
     syntax_line_offset_shifts: Vec<(usize, isize)>,
     syntax_highlights_dirty: bool,
     syntax_highlight_ready_at: Option<Instant>,
     syntax_highlight_request_pending: bool,
     syntax_preview_viewport: Option<(usize, usize)>,
+    syntax_preview_range: Option<(usize, usize)>,
+    syntax_buffer_snapshot: Option<Vec<u8>>,
 }
 
 impl Editor {
@@ -737,12 +744,15 @@ impl Editor {
             marks: [None; 26],
             syntax_highlighter: None,
             syntax_highlights: Vec::new(),
+            syntax_preview_highlights: Vec::new(),
             syntax_line_offsets: Vec::new(),
             syntax_line_offset_shifts: Vec::new(),
             syntax_highlights_dirty: false,
             syntax_highlight_ready_at: None,
             syntax_highlight_request_pending: false,
             syntax_preview_viewport: None,
+            syntax_preview_range: None,
+            syntax_buffer_snapshot: None,
         };
         editor.set_bytes(data);
         editor
@@ -849,10 +859,13 @@ impl Editor {
     pub fn set_syntax_highlighter(&mut self, highlighter: Box<dyn SyntaxHighlighter>) {
         self.syntax_highlighter = Some(highlighter);
         self.syntax_highlights.clear();
+        self.syntax_preview_highlights.clear();
         self.syntax_line_offsets.clear();
         self.syntax_line_offset_shifts.clear();
         self.syntax_highlight_request_pending = false;
         self.syntax_preview_viewport = None;
+        self.syntax_preview_range = None;
+        self.syntax_buffer_snapshot = None;
         self.mark_syntax_highlighting_dirty(false);
     }
 
@@ -860,12 +873,15 @@ impl Editor {
     pub fn clear_syntax_highlighter(&mut self) {
         self.syntax_highlighter = None;
         self.syntax_highlights.clear();
+        self.syntax_preview_highlights.clear();
         self.syntax_line_offsets.clear();
         self.syntax_line_offset_shifts.clear();
         self.syntax_highlights_dirty = false;
         self.syntax_highlight_ready_at = None;
         self.syntax_highlight_request_pending = false;
         self.syntax_preview_viewport = None;
+        self.syntax_preview_range = None;
+        self.syntax_buffer_snapshot = None;
     }
 
     /// Tell the installed highlighter to recompute even when the buffer did
@@ -874,10 +890,13 @@ impl Editor {
     pub fn invalidate_syntax_highlighting(&mut self) {
         self.mark_syntax_highlighting_dirty(false);
         self.syntax_highlights.clear();
+        self.syntax_preview_highlights.clear();
         self.syntax_line_offsets.clear();
         self.syntax_line_offset_shifts.clear();
         self.syntax_highlight_request_pending = false;
         self.syntax_preview_viewport = None;
+        self.syntax_preview_range = None;
+        self.syntax_buffer_snapshot = None;
     }
 
     /// Return the installed highlighter's current ranges in complete-buffer
@@ -932,10 +951,13 @@ impl Editor {
         self.screen_left = 0;
         self.mark_syntax_highlighting_dirty(false);
         self.syntax_highlights.clear();
+        self.syntax_preview_highlights.clear();
         self.syntax_line_offsets.clear();
         self.syntax_line_offset_shifts.clear();
         self.syntax_highlight_request_pending = false;
         self.syntax_preview_viewport = None;
+        self.syntax_preview_range = None;
+        self.syntax_buffer_snapshot = None;
     }
 
     fn mark_syntax_highlighting_dirty(&mut self, defer: bool) {
@@ -943,9 +965,19 @@ impl Editor {
             return;
         }
 
+        if let Some(highlighter) = self.syntax_highlighter.as_mut() {
+            highlighter.invalidate_visible();
+        }
         self.syntax_highlights_dirty = true;
         self.syntax_highlight_ready_at = defer.then(|| Instant::now() + SYNTAX_HIGHLIGHT_DEBOUNCE);
+        self.syntax_preview_highlights.clear();
         self.syntax_preview_viewport = None;
+        self.syntax_preview_range = None;
+        self.syntax_buffer_snapshot = None;
+        if self.syntax_highlights.is_empty() {
+            self.syntax_line_offsets.clear();
+            self.syntax_line_offset_shifts.clear();
+        }
         // Keep the previous ranges visible while the optional highlighter
         // catches up. Editing operations adjust their byte offsets below, so
         // unrelated rows do not flash back to plain text on every keypress.
@@ -960,7 +992,9 @@ impl Editor {
             self.syntax_line_offset_shifts.clear();
         }
         self.syntax_highlights = highlights;
+        self.syntax_preview_highlights.clear();
         self.syntax_preview_viewport = None;
+        self.syntax_preview_range = None;
     }
 
     fn set_syntax_preview(
@@ -969,39 +1003,19 @@ impl Editor {
         visible_range: Range<usize>,
         viewport: (usize, usize),
     ) {
-        let mut combined = Vec::with_capacity(self.syntax_highlights.len() + highlights.len());
-        let visible_start = visible_range.start;
-        let visible_end = visible_range.end;
-        for span in self.syntax_highlights.drain(..) {
-            if span.end <= visible_start || span.start >= visible_end {
-                combined.push(span);
-            } else {
-                if span.start < visible_start {
-                    combined.push(HighlightSpan::new(
-                        span.start,
-                        visible_start.min(span.end),
-                        span.style,
-                    ));
-                }
-                if span.end > visible_end {
-                    combined.push(HighlightSpan::new(
-                        visible_end.max(span.start),
-                        span.end,
-                        span.style,
-                    ));
-                }
-            }
-        }
-        combined.extend(highlights);
-        combined.sort_unstable_by_key(|span| span.start);
-        if combined.is_empty() {
-            self.syntax_line_offsets.clear();
-            self.syntax_line_offset_shifts.clear();
-        } else {
+        let has_preview = !highlights.is_empty();
+        self.syntax_preview_highlights = highlights;
+        self.syntax_preview_range = Some((visible_range.start, visible_range.end));
+        if has_preview && self.syntax_line_offsets.is_empty() {
+            // The full-result spans normally initialize these offsets. A
+            // preview-only highlighter still needs them to render the line
+            // start without rebuilding them on every viewport change.
             self.syntax_line_offsets = line_offsets(&self.lines);
             self.syntax_line_offset_shifts.clear();
+        } else if !has_preview && self.syntax_highlights.is_empty() {
+            self.syntax_line_offsets.clear();
+            self.syntax_line_offset_shifts.clear();
         }
-        self.syntax_highlights = combined;
         self.syntax_preview_viewport = Some(viewport);
     }
 
@@ -1065,16 +1079,18 @@ impl Editor {
         let last_line = first_line
             .saturating_add(self.body_rows())
             .min(self.lines.len());
-        let start = self.lines[..first_line]
-            .iter()
-            .map(|line| line.len() + 1)
-            .sum();
-        let visible_len = self.lines[first_line..last_line]
-            .iter()
-            .enumerate()
-            .map(|(index, line)| line.len() + usize::from(index + 1 < last_line - first_line))
-            .sum::<usize>();
-        start..start.saturating_add(visible_len)
+        let line_offset = |line: usize| {
+            self.syntax_line_offsets
+                .get(line)
+                .map(|_| self.syntax_line_offset(line))
+                .unwrap_or_else(|| self.lines[..line].iter().map(|line| line.len() + 1).sum())
+        };
+        let start = line_offset(first_line);
+        let end = last_line
+            .checked_sub(1)
+            .map(|line| line_offset(line).saturating_add(self.lines[line].len()))
+            .unwrap_or(start);
+        start..end
     }
 
     fn refresh_syntax_preview(&mut self, visible_range: Range<usize>) -> bool {
@@ -1082,16 +1098,22 @@ impl Editor {
         if self.syntax_preview_viewport == Some(viewport) {
             return false;
         }
-        let data = self.bytes();
+        let data = self
+            .syntax_buffer_snapshot
+            .take()
+            .unwrap_or_else(|| self.bytes());
         let highlights = self
             .syntax_highlighter
             .as_mut()
             .and_then(|highlighter| highlighter.highlight_visible(&data, visible_range.clone()));
+        self.syntax_buffer_snapshot = Some(data);
         self.syntax_preview_viewport = Some(viewport);
         if let Some(highlights) = highlights {
             self.set_syntax_preview(highlights, visible_range, viewport);
             true
         } else {
+            self.syntax_preview_highlights.clear();
+            self.syntax_preview_range = None;
             false
         }
     }
@@ -1114,6 +1136,8 @@ impl Editor {
             self.set_syntax_preview(highlights, visible_range, viewport);
             true
         } else {
+            self.syntax_preview_highlights.clear();
+            self.syntax_preview_range = None;
             false
         }
     }
@@ -1146,16 +1170,13 @@ impl Editor {
                 self.set_syntax_highlights(highlights);
                 updated = true;
             }
+            if !self.syntax_highlight_request_pending {
+                self.syntax_buffer_snapshot = None;
+            }
             if self.syntax_highlight_request_pending {
                 if let Some(visible_range) = visible_range {
                     updated |= self.refresh_syntax_preview(visible_range);
                 }
-            }
-            return updated;
-        }
-        if self.syntax_highlight_request_pending && !force {
-            if let Some(visible_range) = visible_range {
-                updated |= self.refresh_syntax_preview(visible_range);
             }
             return updated;
         }
@@ -1164,6 +1185,12 @@ impl Editor {
                 .syntax_highlight_ready_at
                 .is_some_and(|ready_at| Instant::now() < ready_at)
         {
+            // Keep the adjusted full-result spans on screen during the
+            // debounce window. Running a grammar preview here would put the
+            // parser back on the input/render path for every typed byte.
+            return updated;
+        }
+        if self.syntax_highlight_request_pending && !force {
             if let Some(visible_range) = visible_range {
                 updated |= self.refresh_syntax_preview(visible_range);
             }
@@ -1173,7 +1200,10 @@ impl Editor {
         // This copy is intentionally delayed for edits. A highlighter that
         // parses on a worker thread receives one coalesced snapshot instead
         // of one complete buffer per typed byte.
-        let data = self.bytes();
+        let data = self
+            .syntax_buffer_snapshot
+            .take()
+            .unwrap_or_else(|| self.bytes());
         let (highlights, pending) = self
             .syntax_highlighter
             .as_mut()
@@ -1185,8 +1215,12 @@ impl Editor {
         self.syntax_highlight_request_pending = pending;
         if !pending {
             self.set_syntax_highlights(highlights);
+            self.syntax_buffer_snapshot = None;
         } else if let Some(visible_range) = visible_range {
             updated |= self.refresh_syntax_preview_with_data(&data, visible_range);
+            self.syntax_buffer_snapshot = Some(data);
+        } else {
+            self.syntax_buffer_snapshot = Some(data);
         }
         self.syntax_highlights_dirty = false;
         self.syntax_highlight_ready_at = None;
@@ -1264,10 +1298,13 @@ impl Editor {
         self.modified = state.modified;
         self.mark_syntax_highlighting_dirty(true);
         self.syntax_highlights.clear();
+        self.syntax_preview_highlights.clear();
         self.syntax_line_offsets.clear();
         self.syntax_line_offset_shifts.clear();
         self.syntax_highlight_request_pending = false;
         self.syntax_preview_viewport = None;
+        self.syntax_preview_range = None;
+        self.syntax_buffer_snapshot = None;
     }
 
     fn begin_change(&mut self) {
@@ -1758,11 +1795,15 @@ impl Editor {
         } else {
             (None, None)
         };
-        // While an asynchronous highlighter is catching up, render the
-        // current buffer plainly. This avoids both stale byte offsets and an
-        // O(lines) offset rebuild on every typed character.
-        let syntax_enabled = !self.syntax_highlights.is_empty();
+        // Keep adjusted full-result spans visible outside the preview range,
+        // while the preview cursor takes precedence within that range. The
+        // two sorted span lists stay separate so scrolling never rebuilds or
+        // sorts the full-buffer result.
+        let syntax_enabled =
+            !self.syntax_highlights.is_empty() || !self.syntax_preview_highlights.is_empty();
         let mut highlight_cursor = HighlightCursor::new(&self.syntax_highlights);
+        let mut preview_cursor = HighlightCursor::new(&self.syntax_preview_highlights);
+        let preview_range = self.syntax_preview_range;
         let mut frame = Vec::with_capacity(self.screen_rows);
         for screen_line in 0..body {
             let index = self.screen_top + screen_line;
@@ -1786,11 +1827,13 @@ impl Editor {
                 )?;
             }
             if syntax_enabled {
-                write_highlighted_line(
+                write_highlighted_line_with_preview(
                     &mut row,
                     &self.lines[index],
                     self.syntax_line_offset(index),
                     &mut highlight_cursor,
+                    &mut preview_cursor,
+                    preview_range,
                     self.screen_left,
                     width,
                     self.tabstop,
@@ -3431,7 +3474,10 @@ impl Editor {
         self.render(None)?;
         while !self.quit {
             let Some(key) = reader.try_key()? else {
-                let syntax_updated = self.refresh_syntax_highlighting(false, None);
+                let visible_range = (self.syntax_highlights_dirty
+                    || self.syntax_highlight_request_pending)
+                    .then(|| self.visible_byte_range());
+                let syntax_updated = self.refresh_syntax_highlighting(false, visible_range);
                 if self.refresh_size() || syntax_updated {
                     self.render(None)?;
                 }
@@ -3597,11 +3643,37 @@ fn write_plain_line<W: Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_highlighted_line<W: Write>(
     out: &mut W,
     line: &[u8],
     line_start: usize,
     highlights: &mut HighlightCursor<'_>,
+    screen_left: usize,
+    width: usize,
+    tabstop: usize,
+) -> io::Result<()> {
+    let mut preview = HighlightCursor::new(&[]);
+    write_highlighted_line_with_preview(
+        out,
+        line,
+        line_start,
+        highlights,
+        &mut preview,
+        None,
+        screen_left,
+        width,
+        tabstop,
+    )
+}
+
+fn write_highlighted_line_with_preview<W: Write>(
+    out: &mut W,
+    line: &[u8],
+    line_start: usize,
+    highlights: &mut HighlightCursor<'_>,
+    preview: &mut HighlightCursor<'_>,
+    preview_range: Option<(usize, usize)>,
     screen_left: usize,
     width: usize,
     tabstop: usize,
@@ -3616,7 +3688,15 @@ fn write_highlighted_line<W: Write>(
         let visible_start = screen_left.max(display_column);
         let visible_stop = visible_end.min(fragment_end);
         if visible_start < visible_stop {
-            let style = highlights.style_at(line_start + source_offset);
+            let offset = line_start + source_offset;
+            let style = if preview_range.is_some_and(|(start, end)| start <= offset && offset < end)
+            {
+                // An empty preview span list intentionally masks stale full
+                // spans for the visible bytes too.
+                preview.style_at(offset)
+            } else {
+                highlights.style_at(offset)
+            };
             if style != active_style {
                 if active_style.is_some() {
                     write!(out, "\x1b[0m")?;
@@ -4963,6 +5043,16 @@ mod terminal_event_tests {
             .expect("render completed syntax result");
         assert!(editor.rendered_rows[0].starts_with(b"\x1b[38;5;44mtwo"));
         assert!(!editor.rendered_rows[0].starts_with(b"two"));
+
+        let preview_count = visible_ranges.borrow().len();
+        editor
+            .execute_keys(b"iX\x1b")
+            .expect("edit after syntax result");
+        let mut typing_frame = Vec::new();
+        editor
+            .render_to(&mut typing_frame, None)
+            .expect("render during syntax debounce");
+        assert_eq!(visible_ranges.borrow().len(), preview_count);
     }
 
     #[test]
