@@ -760,7 +760,10 @@ impl Editor {
 
     /// Return the current buffer in the same newline form used by `:write`.
     pub fn bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
+        // Sized up front: an asynchronous highlighter takes this snapshot on
+        // every debounced edit, and growing it reallocates the whole buffer
+        // roughly a dozen times for a large file.
+        let mut data = Vec::with_capacity(serialized_lines_len(&self.lines));
         for (index, line) in self.lines.iter().enumerate() {
             data.extend_from_slice(line);
             if index + 1 < self.lines.len() || self.trailing_newline {
@@ -1362,7 +1365,14 @@ impl Editor {
             );
             let delta = inserted_len as isize - removed.len() as isize;
             if delta != 0 {
-                self.syntax_line_offset_shifts.push((row + 1, delta));
+                // Typing runs of bytes into one line would otherwise append one
+                // shift per byte, and `syntax_line_offset` walks this list once
+                // per rendered row. Coalescing keeps it proportional to the
+                // number of edited rows rather than the number of keystrokes.
+                match self.syntax_line_offset_shifts.last_mut() {
+                    Some((first_line, previous)) if *first_line == row + 1 => *previous += delta,
+                    _ => self.syntax_line_offset_shifts.push((row + 1, delta)),
+                }
             }
         }
         self.lines[row].splice(range.clone(), inserted.iter().copied());
@@ -5102,6 +5112,54 @@ mod terminal_event_tests {
             b"\x1b[38;5;42mthree\x1b[0m\x1b[K".to_vec()
         );
         assert!(!typing.windows(b"three".len()).any(|row| row == b"three"));
+    }
+
+    #[test]
+    fn syntax_line_offset_shifts_coalesce_per_edited_row() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Highlighter {
+            calls: Rc<Cell<usize>>,
+        }
+
+        impl SyntaxHighlighter for Highlighter {
+            fn highlight(&mut self, _: &[u8]) -> Vec<HighlightSpan> {
+                self.calls.set(self.calls.get() + 1);
+                vec![HighlightSpan::new(
+                    8,
+                    13,
+                    HighlightStyle::foreground(HighlightColor::Ansi(42)),
+                )]
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let mut editor = Editor::from_bytes(b"one\ntwo\nthree\n", None, false);
+        editor.set_syntax_highlighter(Box::new(Highlighter {
+            calls: Rc::clone(&calls),
+        }));
+        editor.screen_rows = 6;
+        editor.screen_cols = 20;
+        editor
+            .render_to(&mut Vec::new(), None)
+            .expect("render initial syntax highlighting");
+
+        editor
+            .execute_keys(b"iABCDEFGH\x1b")
+            .expect("type a run of bytes into one row");
+        assert_eq!(editor.syntax_line_offset_shifts, vec![(1, 8)]);
+
+        editor
+            .execute_keys(b"jiXY\x1b")
+            .expect("type into a second row");
+        assert_eq!(editor.syntax_line_offset_shifts, vec![(1, 8), (2, 2)]);
+
+        // The coalesced list has to resolve the same offsets a per-byte list
+        // would have produced.
+        assert_eq!(editor.syntax_line_offset(0), 0);
+        assert_eq!(editor.syntax_line_offset(1), 12);
+        assert_eq!(editor.syntax_line_offset(2), 18);
     }
 
     #[test]
