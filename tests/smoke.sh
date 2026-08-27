@@ -38,6 +38,38 @@ printf 'one\ntwo\n' >"$number_file"
 grep -a -F -q '  1 one' "$number_log"
 grep -a -F -q '  2 two' "$number_log"
 
+selection_log="$tmp/selection.session.log"
+selection_file="$tmp/selection-file"
+printf '  one\n\ttwo\n' >"$selection_file"
+{
+	sleep 1
+	printf ':set nu\n'
+	sleep 0.3
+	# SGR mouse coordinates are one-based; the press is in the number gutter
+	# and the release is at the terminal's right edge.
+	printf '\033[<0;1;1M'
+	sleep 0.1
+	printf '\033[<32;40;2M'
+	sleep 0.1
+	printf '\033[<0;40;2m'
+	sleep 0.3
+	printf ':q!\n'
+} | script -qefc "stty rows 8 cols 40; exec $root/vi $selection_file" "$selection_log" >/dev/null 2>&1
+selection_osc=$(printf '\033]52;c;ICBvbmUKCXR3bw==\033\\')
+grep -a -F -q "$selection_osc" "$selection_log"
+mouse_capture=$(printf '\033[?1006h')
+mouse_cleanup=$(printf '\033[?1006l')
+grep -a -F -q "$mouse_capture" "$selection_log"
+grep -a -F -q "$mouse_cleanup" "$selection_log"
+if base64 -d </dev/null >/dev/null 2>&1; then
+	base64_decode=-d
+else
+	base64_decode=-D
+fi
+selection_text=$(printf 'ICBvbmUKCXR3bw==' | base64 "$base64_decode")
+test "$selection_text" = "$(printf '  one\n\ttwo')"
+test "$selection_text" != *'  1 '*
+
 size_log="$tmp/size.session.log"
 size_file="$tmp/size-file"
 i=0

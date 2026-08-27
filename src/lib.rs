@@ -9,9 +9,14 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::clipboard::CopyToClipboard;
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, ExecutableCommand};
 
@@ -300,8 +305,30 @@ where
 // `Editor::syntax_highlights` for non-terminal embedders.
 const SYNTAX_HIGHLIGHT_DEBOUNCE: Duration = Duration::from_millis(75);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionPoint {
+    line: usize,
+    offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionKind {
+    Characters,
+    Word,
+    Lines,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MouseSelection {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+    kind: SelectionKind,
+    dragging: bool,
+}
+
 struct Terminal {
     active: bool,
+    mouse_capture: bool,
 }
 
 impl Terminal {
@@ -312,7 +339,15 @@ impl Terminal {
             let _ = terminal::disable_raw_mode();
             return Err(error);
         }
-        Ok(Self { active: true })
+        if let Err(error) = out.execute(EnableMouseCapture) {
+            let _ = out.execute(LeaveAlternateScreen);
+            let _ = terminal::disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self {
+            active: true,
+            mouse_capture: true,
+        })
     }
 
     fn interactive(&self) -> bool {
@@ -324,6 +359,9 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         if self.active {
             let mut out = io::stdout();
+            if self.mouse_capture {
+                let _ = out.execute(DisableMouseCapture);
+            }
             let _ = execute!(out, LeaveAlternateScreen);
             let _ = terminal::disable_raw_mode();
         }
@@ -337,6 +375,7 @@ struct KeyReader {
     special: bool,
     events: bool,
     resized: bool,
+    mouse: VecDeque<MouseEvent>,
 }
 
 impl KeyReader {
@@ -348,6 +387,7 @@ impl KeyReader {
             special: false,
             events: timed_input,
             resized: false,
+            mouse: VecDeque::new(),
         }
     }
 
@@ -359,6 +399,7 @@ impl KeyReader {
             special: false,
             events: false,
             resized: false,
+            mouse: VecDeque::new(),
         }
     }
 
@@ -384,6 +425,25 @@ impl KeyReader {
 
     fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    fn take_mouse(&mut self) -> Option<MouseEvent> {
+        self.mouse.pop_front()
+    }
+
+    fn push_event(&mut self, event: Event) -> Option<u8> {
+        match event {
+            Event::Mouse(mouse) => {
+                self.mouse.push_back(mouse);
+                None
+            }
+            Event::Resize(_, _) => {
+                self.resized = true;
+                None
+            }
+            Event::Key(key) => self.push_event_key(key),
+            _ => None,
+        }
     }
 
     fn read_more(&mut self) -> io::Result<bool> {
@@ -497,8 +557,14 @@ impl KeyReader {
                         return Ok(None);
                     }
                 }
-                Event::Resize(_, _) => {
-                    self.resized = true;
+                Event::Mouse(mouse) => {
+                    let _ = self.push_event(Event::Mouse(mouse));
+                    if !blocking {
+                        return Ok(None);
+                    }
+                }
+                resize @ Event::Resize(_, _) => {
+                    let _ = self.push_event(resize);
                     return Ok(None);
                 }
                 _ if !blocking => return Ok(None),
@@ -513,7 +579,12 @@ impl KeyReader {
         }
         let event = event::read()?;
         if matches!(event, Event::Resize(_, _)) {
-            self.resized = true;
+            let _ = self.push_event(event);
+            return Ok(Some(0x1b));
+        }
+        if let Event::Mouse(mouse) = event {
+            let _ = self.push_event(Event::Mouse(mouse));
+            return Ok(Some(0x1b));
         }
         let Event::Key(key) = event else {
             return Ok(Some(0x1b));
@@ -552,6 +623,9 @@ impl KeyReader {
                 Event::Resize(_, _) => {
                     self.resized = true;
                     break;
+                }
+                Event::Mouse(mouse) => {
+                    self.mouse.push_back(mouse);
                 }
                 _ => {}
             }
@@ -695,6 +769,9 @@ pub struct Editor {
     screen_left: usize,
     rendered_rows: Vec<Vec<u8>>,
     rendered_size: (usize, usize),
+    selection: Option<MouseSelection>,
+    mouse_viewport_scrolled: bool,
+    last_mouse_click: Option<(Instant, SelectionPoint, u8)>,
     syntax_highlighter: Option<Box<dyn SyntaxHighlighter>>,
     syntax_highlights: Vec<HighlightSpan>,
     syntax_preview_highlights: Vec<HighlightSpan>,
@@ -768,6 +845,9 @@ impl Editor {
             screen_left: 0,
             rendered_rows: Vec::new(),
             rendered_size: (0, 0),
+            selection: None,
+            mouse_viewport_scrolled: false,
+            last_mouse_click: None,
             marks: [None; 26],
             syntax_highlighter: None,
             syntax_highlights: Vec::new(),
@@ -979,6 +1059,9 @@ impl Editor {
         self.col = 0;
         self.screen_top = 0;
         self.screen_left = 0;
+        self.selection = None;
+        self.mouse_viewport_scrolled = false;
+        self.last_mouse_click = None;
         self.mark_syntax_highlighting_dirty(false);
         self.syntax_highlights.clear();
         self.syntax_preview_highlights.clear();
@@ -1732,9 +1815,339 @@ impl Editor {
         }
     }
 
+    fn clear_mouse_selection(&mut self) {
+        self.selection = None;
+        self.mouse_viewport_scrolled = false;
+        self.last_mouse_click = None;
+    }
+
+    fn selection_bounds(&self) -> Option<(SelectionPoint, SelectionPoint)> {
+        let selection = self.selection?;
+        if selection.anchor == selection.focus {
+            return None;
+        }
+        let (start, mut end) = if selection.anchor <= selection.focus {
+            (selection.anchor, selection.focus)
+        } else {
+            (selection.focus, selection.anchor)
+        };
+        if selection.kind == SelectionKind::Characters {
+            let line_length = self.lines.get(end.line)?.len();
+            if end.offset < line_length {
+                end.offset += 1;
+            }
+        }
+        Some((start, end))
+    }
+
+    fn selection_offsets_on_line(&self, line: usize) -> Option<(usize, usize)> {
+        let selection = self.selection?;
+        match selection.kind {
+            SelectionKind::Lines => {
+                let first = selection.anchor.line.min(selection.focus.line);
+                let last = selection.anchor.line.max(selection.focus.line);
+                (first..=last)
+                    .contains(&line)
+                    .then(|| (0, self.lines.get(line).map_or(0, Vec::len)))
+            }
+            SelectionKind::Characters | SelectionKind::Word => {
+                let (start, end) = self.selection_bounds()?;
+                if line < start.line || line > end.line {
+                    return None;
+                }
+                let length = self.lines.get(line)?.len();
+                let first = if line == start.line {
+                    start.offset.min(length)
+                } else {
+                    0
+                };
+                let last = if line == end.line {
+                    end.offset.min(length)
+                } else {
+                    length
+                };
+                (first < last).then_some((first, last))
+            }
+        }
+    }
+
+    fn selection_text(&self) -> Option<Vec<u8>> {
+        let selection = self.selection?;
+        if selection.kind == SelectionKind::Lines {
+            let first = selection.anchor.line.min(selection.focus.line);
+            let last = selection
+                .anchor
+                .line
+                .max(selection.focus.line)
+                .min(self.lines.len().saturating_sub(1));
+            let mut text = Vec::new();
+            for line in first..=last {
+                if line > first {
+                    text.push(b'\n');
+                }
+                text.extend_from_slice(&self.lines[line]);
+            }
+            return (!text.is_empty()).then_some(text);
+        }
+
+        let (start, end) = self.selection_bounds()?;
+        let mut text = Vec::new();
+        for line in start.line..=end.line.min(self.lines.len().saturating_sub(1)) {
+            let source = &self.lines[line];
+            let first = if line == start.line {
+                start.offset.min(source.len())
+            } else {
+                0
+            };
+            let last = if line == end.line {
+                end.offset.min(source.len())
+            } else {
+                source.len()
+            };
+            text.extend_from_slice(&source[first..last]);
+            if line < end.line {
+                text.push(b'\n');
+            }
+        }
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn mouse_point(&self, mouse: MouseEvent) -> Option<SelectionPoint> {
+        let screen_row = mouse.row as usize;
+        if screen_row >= self.body_rows() || self.lines.is_empty() {
+            // The last row is the status row. Do not let a status click turn
+            // into a selection of the last file line.
+            return None;
+        }
+        let line = self.screen_top.saturating_add(screen_row);
+        let line = line.min(self.lines.len().saturating_sub(1));
+        if self.screen_top.saturating_add(screen_row) >= self.lines.len() {
+            return Some(SelectionPoint {
+                line,
+                offset: self.lines[line].len(),
+            });
+        }
+        let column = mouse.column as usize;
+        let gutter = self.number_column_width();
+        if column < gutter {
+            return Some(SelectionPoint { line, offset: 0 });
+        }
+        let display_column = self
+            .screen_left
+            .saturating_add(column.saturating_sub(gutter));
+        Some(SelectionPoint {
+            line,
+            offset: byte_offset_at_display_column(&self.lines[line], display_column, self.tabstop),
+        })
+    }
+
+    fn mouse_click_count(&mut self, point: SelectionPoint) -> u8 {
+        const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(450);
+        let now = Instant::now();
+        let count = match self.last_mouse_click {
+            Some((when, previous, count))
+                if previous == point
+                    && now.duration_since(when) <= DOUBLE_CLICK_WINDOW
+                    && count < 3 =>
+            {
+                count + 1
+            }
+            _ => 1,
+        };
+        self.last_mouse_click = Some((now, point, count));
+        count
+    }
+
+    fn auto_scroll_for_mouse(&mut self, mouse: MouseEvent) {
+        let body = self.body_rows();
+        let row = mouse.row as usize;
+        if row == 0 {
+            self.screen_top = self.screen_top.saturating_sub(1);
+        } else if row.saturating_add(1) >= body {
+            let last_line = self.lines.len().saturating_sub(1);
+            self.screen_top = self.screen_top.saturating_add(1).min(last_line);
+        }
+
+        let column = mouse.column as usize;
+        let gutter = self.number_column_width();
+        if column <= gutter {
+            self.screen_left = self.screen_left.saturating_sub(1);
+        } else if column.saturating_add(1) >= self.screen_cols {
+            self.screen_left = self.screen_left.saturating_add(1);
+        }
+        self.mouse_viewport_scrolled = true;
+    }
+
+    fn word_bounds(&self, point: SelectionPoint) -> (SelectionPoint, SelectionPoint) {
+        let line = &self.lines[point.line];
+        if line.is_empty() {
+            return (point, point);
+        }
+        let at = point.offset.min(line.len().saturating_sub(1));
+        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        let word_kind = word(line[at]);
+        let mut start = at;
+        while start > 0 && word(line[start - 1]) == word_kind {
+            start -= 1;
+        }
+        let mut end = at + 1;
+        while end < line.len() && word(line[end]) == word_kind {
+            end += 1;
+        }
+        (
+            SelectionPoint {
+                line: point.line,
+                offset: start,
+            },
+            SelectionPoint {
+                line: point.line,
+                offset: end,
+            },
+        )
+    }
+
+    fn finish_mouse_selection(&mut self) -> Option<Vec<u8>> {
+        let selection = self.selection.as_mut()?;
+        if !selection.dragging {
+            return None;
+        }
+        selection.dragging = false;
+        self.selection_text()
+    }
+
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Option<Vec<u8>> {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Holding Shift is the explicit escape hatch for terminal
+                // native selection in terminals that provide one.
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    return None;
+                }
+                let previous = self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.dragging);
+                let copied = previous.then(|| self.finish_mouse_selection()).flatten();
+                let point = match self.mouse_point(mouse) {
+                    Some(point) => point,
+                    None => return copied,
+                };
+                let count = self.mouse_click_count(point);
+                let line_length = self.lines[point.line].len();
+                let linewise = count >= 3
+                    || mouse.modifiers.contains(KeyModifiers::ALT)
+                    || mouse.modifiers.contains(KeyModifiers::SUPER);
+                let wordwise =
+                    !linewise && (count == 2 || mouse.modifiers.contains(KeyModifiers::CONTROL));
+                let (anchor, focus, kind) = if linewise {
+                    (
+                        SelectionPoint {
+                            line: point.line,
+                            offset: 0,
+                        },
+                        SelectionPoint {
+                            line: point.line,
+                            offset: line_length,
+                        },
+                        SelectionKind::Lines,
+                    )
+                } else if wordwise {
+                    let (start, end) = self.word_bounds(point);
+                    (start, end, SelectionKind::Word)
+                } else {
+                    (point, point, SelectionKind::Characters)
+                };
+                self.selection = Some(MouseSelection {
+                    anchor,
+                    focus,
+                    kind,
+                    dragging: true,
+                });
+                copied
+            }
+            MouseEventKind::Drag(MouseButton::Left)
+                if self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.dragging) =>
+            {
+                self.auto_scroll_for_mouse(mouse);
+                let point = self.mouse_point(mouse)?;
+                if let Some(selection) = self.selection.as_mut() {
+                    if selection.kind != SelectionKind::Lines {
+                        selection.kind = SelectionKind::Characters;
+                    }
+                    selection.focus = if selection.kind == SelectionKind::Lines {
+                        SelectionPoint {
+                            line: point.line,
+                            offset: self.lines[point.line].len(),
+                        }
+                    } else {
+                        point
+                    };
+                }
+                None
+            }
+            MouseEventKind::Moved
+                if self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.dragging) =>
+            {
+                // With any-event tracking, a motion without a button is the
+                // first reliable indication that a multiplexer swallowed the
+                // left-button release.
+                self.finish_mouse_selection()
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let copied = self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.dragging)
+                    .then(|| self.finish_mouse_selection())
+                    .flatten();
+                if copied.is_none()
+                    && self
+                        .selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.anchor == selection.focus)
+                {
+                    self.selection = None;
+                }
+                copied
+            }
+            MouseEventKind::ScrollUp => {
+                self.screen_top = self.screen_top.saturating_sub(3);
+                self.mouse_viewport_scrolled = true;
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                let last_line = self.lines.len().saturating_sub(1);
+                self.screen_top = self.screen_top.saturating_add(3).min(last_line);
+                self.mouse_viewport_scrolled = true;
+                None
+            }
+            MouseEventKind::ScrollLeft => {
+                self.screen_left = self.screen_left.saturating_sub(3);
+                self.mouse_viewport_scrolled = true;
+                None
+            }
+            MouseEventKind::ScrollRight => {
+                self.screen_left = self.screen_left.saturating_add(3);
+                self.mouse_viewport_scrolled = true;
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn sync_screen(&mut self) {
         let last_line = self.lines.len().saturating_sub(1);
         let body = self.body_rows();
+        if self.selection.is_some() || self.mouse_viewport_scrolled {
+            self.screen_top = self.screen_top.min(last_line);
+            return;
+        }
         let half = body / 2;
         self.screen_top = self.screen_top.min(last_line);
 
@@ -1880,8 +2293,9 @@ impl Editor {
                     style,
                 )?;
             }
+            let selected = self.selection_offsets_on_line(index);
             if syntax_enabled {
-                write_highlighted_line_with_preview(
+                write_highlighted_line_with_selection(
                     &mut row,
                     &self.lines[index],
                     self.syntax_line_offset(index),
@@ -1891,14 +2305,16 @@ impl Editor {
                     self.screen_left,
                     width,
                     self.tabstop,
+                    selected,
                 )?;
             } else {
-                write_plain_line(
+                write_plain_line_with_selection(
                     &mut row,
                     &self.lines[index],
                     self.screen_left,
                     width,
                     self.tabstop,
+                    selected,
                 )?;
             }
             row.extend_from_slice(b"\x1b[K");
@@ -3539,6 +3955,21 @@ impl Editor {
         self.render(None)?;
         while !self.quit {
             let Some(key) = reader.try_key()? else {
+                let mut handled_mouse = false;
+                while let Some(mouse) = reader.take_mouse() {
+                    handled_mouse = true;
+                    if let Some(text) = self.handle_mouse_event(mouse) {
+                        copy_selection_to_clipboards(&text);
+                    }
+                }
+                if handled_mouse {
+                    if reader.take_resized() {
+                        self.force_redraw();
+                    }
+                    self.refresh_size();
+                    self.render(None)?;
+                    continue;
+                }
                 let visible_range = (self.syntax_highlights_dirty
                     || self.syntax_highlight_request_pending)
                     .then(|| self.visible_byte_range());
@@ -3554,6 +3985,16 @@ impl Editor {
                 }
                 continue;
             };
+            // A release can be lost by a terminal or multiplexer while a
+            // mouse drag is in progress. The next keyboard event is an
+            // unambiguous end of that drag, so finalize it before handling
+            // the key and retain the usual keyboard-only editor contract.
+            if let Some(text) = self.finish_mouse_selection() {
+                copy_selection_to_clipboards(&text);
+            }
+            if self.selection.is_some() || self.mouse_viewport_scrolled {
+                self.clear_mouse_selection();
+            }
             let special = reader.take_special();
             if self.hit_return {
                 if matches!(key, b'\r' | b'\n') {
@@ -3584,6 +4025,133 @@ impl Editor {
         let mut out = io::stdout().lock();
         write!(out, "\x1b[?25h\x1b[{};1H\x1b[K", self.screen_rows)?;
         out.flush()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardDestination {
+    Clipboard,
+    Primary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClipboardHelperCommand {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+fn clipboard_helper_commands(destination: ClipboardDestination) -> Vec<ClipboardHelperCommand> {
+    let mut commands = Vec::new();
+    #[cfg(unix)]
+    {
+        match destination {
+            ClipboardDestination::Clipboard => {
+                commands.push(ClipboardHelperCommand {
+                    program: "wl-copy",
+                    args: &[],
+                });
+                commands.push(ClipboardHelperCommand {
+                    program: "xclip",
+                    args: &["-selection", "clipboard"],
+                });
+                commands.push(ClipboardHelperCommand {
+                    program: "xsel",
+                    args: &["--clipboard", "--input"],
+                });
+                #[cfg(target_os = "macos")]
+                commands.push(ClipboardHelperCommand {
+                    program: "pbcopy",
+                    args: &[],
+                });
+            }
+            ClipboardDestination::Primary => {
+                commands.push(ClipboardHelperCommand {
+                    program: "wl-copy",
+                    args: &["--primary"],
+                });
+                commands.push(ClipboardHelperCommand {
+                    program: "xclip",
+                    args: &["-selection", "primary"],
+                });
+                commands.push(ClipboardHelperCommand {
+                    program: "xsel",
+                    args: &["--primary", "--input"],
+                });
+            }
+        }
+    }
+    #[cfg(windows)]
+    if destination == ClipboardDestination::Clipboard {
+        commands.push(ClipboardHelperCommand {
+            program: "clip.exe",
+            args: &[],
+        });
+    }
+    commands
+}
+
+fn write_osc52_clipboard<W: Write>(out: &mut W, text: &[u8]) -> io::Result<()> {
+    out.execute(CopyToClipboard::to_clipboard_from(text))?;
+    #[cfg(unix)]
+    out.execute(CopyToClipboard::to_primary_from(text))?;
+    out.flush()
+}
+
+fn run_clipboard_helper(command: ClipboardHelperCommand, text: &[u8]) -> bool {
+    let Ok(mut child) = Command::new(command.program)
+        .args(command.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .and_then(|mut stdin| stdin.write_all(text).ok())
+        .is_some();
+    if !wrote {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn copy_selection_to_clipboards(text: &[u8]) {
+    {
+        let mut out = io::stdout().lock();
+        let _ = write_osc52_clipboard(&mut out, text);
+    }
+    for destination in [
+        ClipboardDestination::Clipboard,
+        ClipboardDestination::Primary,
+    ] {
+        let commands = clipboard_helper_commands(destination);
+        for command in commands {
+            if run_clipboard_helper(command, text) {
+                break;
+            }
+        }
+        #[cfg(not(unix))]
+        if destination == ClipboardDestination::Primary {
+            break;
+        }
     }
 }
 
@@ -3635,12 +4203,25 @@ impl<'a> HighlightCursor<'a> {
 
 fn fragment_len(byte: u8, display_column: usize, tabstop: usize) -> usize {
     if byte == b'\t' {
+        let tabstop = tabstop.max(1);
         tabstop - (display_column % tabstop)
     } else if byte.is_ascii_control() {
         2
     } else {
         1
     }
+}
+
+fn byte_offset_at_display_column(line: &[u8], target: usize, tabstop: usize) -> usize {
+    let mut display_column: usize = 0;
+    for (offset, byte) in line.iter().copied().enumerate() {
+        let end = display_column.saturating_add(fragment_len(byte, display_column, tabstop));
+        if target < end {
+            return offset;
+        }
+        display_column = end;
+    }
+    line.len()
 }
 
 fn write_fragment<W: Write>(out: &mut W, byte: u8, start: usize, stop: usize) -> io::Result<()> {
@@ -3692,6 +4273,7 @@ fn write_line_number<W: Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_plain_line<W: Write>(
     out: &mut W,
     line: &[u8],
@@ -3699,15 +4281,38 @@ fn write_plain_line<W: Write>(
     width: usize,
     tabstop: usize,
 ) -> io::Result<()> {
+    write_plain_line_with_selection(out, line, screen_left, width, tabstop, None)
+}
+
+fn write_plain_line_with_selection<W: Write>(
+    out: &mut W,
+    line: &[u8],
+    screen_left: usize,
+    width: usize,
+    tabstop: usize,
+    selection: Option<(usize, usize)>,
+) -> io::Result<()> {
     let visible_end = screen_left.saturating_add(width);
     let mut display_column = 0;
+    let mut selected = false;
 
-    for byte in line.iter().copied() {
+    for (source_offset, byte) in line.iter().copied().enumerate() {
         let length = fragment_len(byte, display_column, tabstop);
         let fragment_end = display_column + length;
         let visible_start = screen_left.max(display_column);
         let visible_stop = visible_end.min(fragment_end);
         if visible_start < visible_stop {
+            let next_selected =
+                selection.is_some_and(|(start, end)| start <= source_offset && source_offset < end);
+            if next_selected != selected {
+                if selected {
+                    out.write_all(b"\x1b[0m")?;
+                }
+                if next_selected {
+                    out.write_all(b"\x1b[7m")?;
+                }
+                selected = next_selected;
+            }
             write_fragment(
                 out,
                 byte,
@@ -3719,6 +4324,9 @@ fn write_plain_line<W: Write>(
         if display_column >= visible_end {
             break;
         }
+    }
+    if selected {
+        out.write_all(b"\x1b[0m")?;
     }
     Ok(())
 }
@@ -3747,6 +4355,8 @@ fn write_highlighted_line<W: Write>(
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn write_highlighted_line_with_preview<W: Write>(
     out: &mut W,
     line: &[u8],
@@ -3758,9 +4368,37 @@ fn write_highlighted_line_with_preview<W: Write>(
     width: usize,
     tabstop: usize,
 ) -> io::Result<()> {
+    write_highlighted_line_with_selection(
+        out,
+        line,
+        line_start,
+        highlights,
+        preview,
+        preview_range,
+        screen_left,
+        width,
+        tabstop,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_highlighted_line_with_selection<W: Write>(
+    out: &mut W,
+    line: &[u8],
+    line_start: usize,
+    highlights: &mut HighlightCursor<'_>,
+    preview: &mut HighlightCursor<'_>,
+    preview_range: Option<(usize, usize)>,
+    screen_left: usize,
+    width: usize,
+    tabstop: usize,
+    selection: Option<(usize, usize)>,
+) -> io::Result<()> {
     let visible_end = screen_left.saturating_add(width);
     let mut display_column = 0;
     let mut active_style = None;
+    let mut active_selection = false;
 
     for (source_offset, byte) in line.iter().copied().enumerate() {
         let length = fragment_len(byte, display_column, tabstop);
@@ -3777,14 +4415,20 @@ fn write_highlighted_line_with_preview<W: Write>(
             } else {
                 highlights.style_at(offset)
             };
-            if style != active_style {
-                if active_style.is_some() {
+            let selected =
+                selection.is_some_and(|(start, end)| start <= source_offset && source_offset < end);
+            if style != active_style || selected != active_selection {
+                if active_style.is_some() || active_selection {
                     write!(out, "\x1b[0m")?;
                 }
                 if let Some(style) = style {
                     style.write_sgr(out)?;
                 }
+                if selected {
+                    write!(out, "\x1b[7m")?;
+                }
                 active_style = style;
+                active_selection = selected;
             }
             let start = visible_start - display_column;
             let stop = visible_stop - display_column;
@@ -3795,7 +4439,7 @@ fn write_highlighted_line_with_preview<W: Write>(
             break;
         }
     }
-    if active_style.is_some() {
+    if active_style.is_some() || active_selection {
         write!(out, "\x1b[0m")?;
     }
     Ok(())
@@ -4832,6 +5476,260 @@ pub fn run_with_editor_setup(
 mod terminal_event_tests {
     use super::*;
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_events_are_queued_without_changing_keyboard_events() {
+        let mut reader = KeyReader::from_bytes(&[]);
+        let event = Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1));
+        assert_eq!(reader.push_event(event), None);
+        assert_eq!(
+            reader.take_mouse(),
+            Some(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1))
+        );
+        assert_eq!(
+            reader.push_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            ))),
+            Some(b'x')
+        );
+    }
+
+    #[test]
+    fn numbered_mouse_selection_copies_only_source_text() {
+        let mut editor = Editor::from_bytes(b"  one\n\ttwo\n\nthree", None, false);
+        editor.screen_rows = 5;
+        editor.screen_cols = 20;
+        editor.execute_ex("set nu");
+
+        assert_eq!(
+            editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0)),
+            None
+        );
+        assert_eq!(
+            editor.handle_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 19, 2)),
+            None
+        );
+        let copied = editor
+            .handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 19, 2))
+            .expect("release copies a selection");
+        assert_eq!(copied, b"  one\n\ttwo\n");
+        assert!(!copied
+            .windows(b"  1 ".len())
+            .any(|window| window == b"  1 "));
+        assert!(!copied
+            .windows(b"  2 ".len())
+            .any(|window| window == b"  2 "));
+    }
+
+    #[test]
+    fn selection_overlay_starts_after_the_gutter_and_keeps_syntax_styles() {
+        let mut editor = Editor::from_bytes(b"one\ntwo", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        editor.execute_ex("set nu");
+        editor.set_syntax_highlighter(Box::new(|_: &[u8]| {
+            vec![HighlightSpan::new(
+                0,
+                3,
+                HighlightStyle::foreground(HighlightColor::Ansi(42)),
+            )]
+        }));
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 6, 0));
+
+        let mut rendered = Vec::new();
+        editor
+            .render_to(&mut rendered, None)
+            .expect("render selected syntax line");
+        assert!(rendered
+            .windows(b"  1 \x1b[0m".len())
+            .any(|window| window == b"  1 \x1b[0m"));
+        assert!(rendered
+            .windows(b"\x1b[38;5;42m\x1b[7mone".len())
+            .any(|window| window == b"\x1b[38;5;42m\x1b[7mone"));
+        assert!(!rendered
+            .windows(b"\x1b[7m  1 ".len())
+            .any(|window| window == b"\x1b[7m  1 "));
+    }
+
+    #[test]
+    fn double_and_triple_clicks_select_words_and_lines() {
+        let mut editor = Editor::from_bytes(b"alpha beta\ngamma", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 7, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 7, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 7, 0));
+        let word = editor
+            .handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 7, 0))
+            .expect("double click selects a word");
+        assert_eq!(word, b"beta");
+
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        let line = editor
+            .handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0))
+            .expect("triple click selects a line");
+        assert_eq!(line, b"alpha beta");
+    }
+
+    #[test]
+    fn status_row_mouse_clicks_are_ignored() {
+        let mut editor = Editor::from_bytes(b"one", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        assert_eq!(
+            editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 3)),
+            None
+        );
+        assert!(editor.selection.is_none());
+    }
+
+    #[test]
+    fn mouse_hit_testing_handles_tabs_controls_and_horizontal_scroll() {
+        assert_eq!(byte_offset_at_display_column(b"\tab", 0, 8), 0);
+        assert_eq!(byte_offset_at_display_column(b"\tab", 7, 8), 0);
+        assert_eq!(byte_offset_at_display_column(b"\tab", 8, 8), 1);
+        assert_eq!(byte_offset_at_display_column(b"a\x01b", 1, 8), 1);
+        assert_eq!(byte_offset_at_display_column(b"a\x01b", 2, 8), 1);
+
+        let mut editor = Editor::from_bytes(b"\t  a\x01bc", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 16;
+        editor.screen_left = 10;
+        assert_eq!(
+            editor.mouse_point(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0)),
+            Some(SelectionPoint { line: 0, offset: 3 })
+        );
+        assert_eq!(
+            editor.mouse_point(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0)),
+            Some(SelectionPoint { line: 0, offset: 4 })
+        );
+    }
+
+    #[test]
+    fn reverse_and_right_edge_selections_have_no_terminal_padding() {
+        let mut editor = Editor::from_bytes(b"abcdef\nsecond", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 8;
+
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 1, 0));
+        let reverse = editor
+            .handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0))
+            .expect("reverse selection copies");
+        assert_eq!(reverse, b"bcdef");
+
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 7, 0));
+        let edge = editor
+            .handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 7, 0))
+            .expect("right edge selection copies");
+        assert_eq!(edge, b"abcdef");
+    }
+
+    #[test]
+    fn selection_scrolls_without_moving_the_vi_cursor_or_dropping_lines() {
+        let mut data = Vec::new();
+        for line in 0..12 {
+            if line > 0 {
+                data.push(b'\n');
+            }
+            data.extend_from_slice(format!("line{line}").as_bytes());
+        }
+        let mut editor = Editor::from_bytes(&data, None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        assert_eq!(editor.cursor(), (0, 0));
+
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        for _ in 0..5 {
+            editor.handle_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 19, 2));
+        }
+        assert_eq!(editor.cursor(), (0, 0));
+        assert_eq!(editor.screen_top, 5);
+        let copied = editor
+            .handle_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 19, 2))
+            .expect("edge drag copies");
+        assert_eq!(
+            copied,
+            b"line0\nline1\nline2\nline3\nline4\nline5\nline6\nline7"
+        );
+
+        editor.selection = None;
+        editor.mouse_viewport_scrolled = false;
+        editor.handle_mouse_event(mouse(MouseEventKind::ScrollDown, 3, 0));
+        assert_eq!(editor.cursor(), (0, 0));
+        assert_eq!(editor.screen_top, 8);
+    }
+
+    #[test]
+    fn a_missed_mouse_release_can_be_recovered_by_the_next_key() {
+        let mut editor = Editor::from_bytes(b"one\ntwo", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
+        let copied = editor
+            .finish_mouse_selection()
+            .expect("the pending drag is finalized");
+        assert_eq!(copied, b"one");
+        assert!(editor.finish_mouse_selection().is_none());
+
+        editor.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        editor.handle_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
+        let copied = editor
+            .handle_mouse_event(mouse(MouseEventKind::Moved, 2, 0))
+            .expect("buttonless motion recovers a missed release");
+        assert_eq!(copied, b"one");
+    }
+
+    #[test]
+    fn osc52_clipboard_encoding_targets_clipboard_and_primary() {
+        let mut encoded = Vec::new();
+        write_osc52_clipboard(&mut encoded, b"one\ntwo").expect("encode OSC 52");
+        assert_eq!(
+            encoded,
+            b"\x1b]52;c;b25lCnR3bw==\x1b\\\x1b]52;p;b25lCnR3bw==\x1b\\"
+        );
+    }
+
+    #[test]
+    fn platform_clipboard_helpers_use_argument_vectors() {
+        let clipboard = clipboard_helper_commands(ClipboardDestination::Clipboard);
+        let primary = clipboard_helper_commands(ClipboardDestination::Primary);
+        #[cfg(unix)]
+        {
+            assert_eq!(clipboard[0].program, "wl-copy");
+            assert_eq!(clipboard[0].args, &[] as &[&str]);
+            assert_eq!(primary[0].program, "wl-copy");
+            assert_eq!(primary[0].args, &["--primary"]);
+            assert!(clipboard.iter().all(|command| command.program != "sh"));
+            assert!(primary.iter().all(|command| command.program != "sh"));
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            clipboard,
+            vec![ClipboardHelperCommand {
+                program: "clip.exe",
+                args: &[]
+            }]
+        );
+    }
+
     #[test]
     fn crossterm_events_preserve_editor_key_contract() {
         let mut reader = KeyReader::from_bytes(&[]);
@@ -5103,7 +6001,7 @@ mod terminal_event_tests {
         editor
             .render_to(&mut first_frame, None)
             .expect("render first syntax preview");
-        assert_eq!(visible_ranges.borrow().as_slice(), [0..7]);
+        assert_eq!(visible_ranges.borrow().as_slice(), vec![0..7]);
         assert!(first_frame
             .windows(b"\x1b[38;5;42mone".len())
             .any(|row| row == b"\x1b[38;5;42mone"));

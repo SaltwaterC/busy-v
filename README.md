@@ -63,6 +63,22 @@ map an external syntax engine's token ranges without bringing that engine into
 this crate. Call `invalidate_syntax_highlighting` when the host changes its
 language or theme without changing the buffer.
 
+## Standalone mouse selection
+
+The standalone `vi` frontend owns ordinary left-button selection. Dragging
+selects file bytes rather than terminal cells, so line numbers, gutter spacing,
+and terminal fill are never copied; tabs, indentation, control-byte text, and
+line breaks come from the source buffer. Double-click selects a word and
+triple-click selects whole lines. The mouse wheel scrolls the viewport without
+moving the vi cursor, and dragging against an edge scrolls while extending the
+selection. Hold Shift to request the terminal's native selection behavior.
+
+On release, the selection is sent with OSC 52 to the terminal clipboard (and
+the Unix primary selection where supported). OSC 52 must be enabled by the
+terminal or multiplexer. As a best-effort fallback, the frontend also tries
+`wl-copy`, `xclip`, `xsel`, `pbcopy`, or `clip.exe` when available; helper
+failures are harmless.
+
 Unlike the reference version, the resulting binary is large by comparison. Not by
 a tiny margin. Almost 7X larger. I chose BusyBox's implementation as reference as
 it makes porting far easier when the footprint after removing dead code is ~3kloc.

@@ -6,7 +6,7 @@ description = "A small, safe, vi-like editor"
 license = "GPL-2.0-or-later"
 
 [dependencies]
-crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
+crossterm = { version = "0.29", default-features = false, features = ["events", "osc52", "windows"] }
 libc = "0.2"
 
 [lib]
