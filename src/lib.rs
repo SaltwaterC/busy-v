@@ -336,6 +336,7 @@ struct KeyReader {
     timed_input: bool,
     special: bool,
     events: bool,
+    resized: bool,
 }
 
 impl KeyReader {
@@ -346,6 +347,7 @@ impl KeyReader {
             timed_input,
             special: false,
             events: timed_input,
+            resized: false,
         }
     }
 
@@ -356,6 +358,7 @@ impl KeyReader {
             timed_input: false,
             special: false,
             events: false,
+            resized: false,
         }
     }
 
@@ -363,6 +366,20 @@ impl KeyReader {
         let special = self.special;
         self.special = false;
         special
+    }
+
+    /// Whether a resize was observed since this was last asked, clearing the
+    /// record.
+    ///
+    /// The terminal destroys screen content on every resize — the alternate
+    /// screen has no scrollback to restore rows from — so a caller that renders
+    /// differentially has to repaint in full whenever this is true. Polling the
+    /// size instead is not enough: a shrink and a matching grow that both land
+    /// between two polls leave the size unchanged and the screen displaced.
+    fn take_resized(&mut self) -> bool {
+        let resized = self.resized;
+        self.resized = false;
+        resized
     }
 
     fn has_pending(&self) -> bool {
@@ -480,7 +497,10 @@ impl KeyReader {
                         return Ok(None);
                     }
                 }
-                Event::Resize(_, _) => return Ok(None),
+                Event::Resize(_, _) => {
+                    self.resized = true;
+                    return Ok(None);
+                }
                 _ if !blocking => return Ok(None),
                 _ => {}
             }
@@ -491,7 +511,11 @@ impl KeyReader {
         if !event::poll(std::time::Duration::from_millis(50))? {
             return Ok(Some(0x1b));
         }
-        let Event::Key(key) = event::read()? else {
+        let event = event::read()?;
+        if matches!(event, Event::Resize(_, _)) {
+            self.resized = true;
+        }
+        let Event::Key(key) = event else {
             return Ok(Some(0x1b));
         };
         if key.kind == KeyEventKind::Release {
@@ -525,7 +549,10 @@ impl KeyReader {
                         return Ok(Some(key));
                     }
                 }
-                Event::Resize(_, _) => break,
+                Event::Resize(_, _) => {
+                    self.resized = true;
+                    break;
+                }
                 _ => {}
             }
         }
@@ -1670,6 +1697,23 @@ impl Editor {
         changed
     }
 
+    /// Drops what the last render believed was on screen, so the next one
+    /// clears the terminal and repaints every row.
+    ///
+    /// [`Editor::render_to`] writes only the rows that differ from
+    /// `rendered_rows`, which assumes nothing but this editor changes the
+    /// screen. A resize breaks that assumption: the terminal drops rows on a
+    /// shrink and pushes the survivors up again on a grow, and it does not tell
+    /// the program which rows moved. Comparing sizes cannot detect it either,
+    /// because a shrink and a matching grow leave the size where it started
+    /// while the content has moved. Without this the stale rows are never
+    /// rewritten, so the buffer and the screen stay out of step for the rest of
+    /// the session.
+    fn force_redraw(&mut self) {
+        self.rendered_rows.clear();
+        self.rendered_size = (0, 0);
+    }
+
     fn body_rows(&self) -> usize {
         self.screen_rows.saturating_sub(1).max(1)
     }
@@ -1930,12 +1974,19 @@ impl Editor {
         self.render(Some(&prompt))?;
         loop {
             let Some(key) = reader.try_key()? else {
-                if self.refresh_size() {
+                let resized = reader.take_resized();
+                if resized {
+                    self.force_redraw();
+                }
+                if self.refresh_size() || resized {
                     self.render(Some(&prompt))?;
                 }
                 continue;
             };
             let _ = reader.take_special();
+            if reader.take_resized() {
+                self.force_redraw();
+            }
             match key {
                 b'\r' | b'\n' => return Ok(Some(value)),
                 0x1b => return Ok(None),
@@ -3100,7 +3151,11 @@ impl Editor {
                 (self.row, self.col) =
                     self.motion(if command == b' ' { b'l' } else { b'h' }, count);
             }
-            12 => {}
+            // Vi's redraw. The screen is repainted by the render that follows
+            // every command, so all this has to do is drop the differential
+            // renderer's cache — which is also the only way out of a desync
+            // this editor did not cause.
+            12 => self.force_redraw(),
             25 => {
                 self.scroll_screen(1, -1);
             }
@@ -3488,7 +3543,13 @@ impl Editor {
                     || self.syntax_highlight_request_pending)
                     .then(|| self.visible_byte_range());
                 let syntax_updated = self.refresh_syntax_highlighting(false, visible_range);
-                if self.refresh_size() || syntax_updated {
+                let resized = reader.take_resized();
+                if resized {
+                    self.force_redraw();
+                }
+                // `refresh_size` is deliberately not the only trigger: a resize
+                // that ends where it started still moved the screen's content.
+                if self.refresh_size() || resized || syntax_updated {
                     self.render(None)?;
                 }
                 continue;
@@ -3499,6 +3560,9 @@ impl Editor {
                     self.hit_return = false;
                     self.clear_status();
                 }
+                if reader.take_resized() {
+                    self.force_redraw();
+                }
                 self.refresh_size();
                 self.render(None)?;
                 continue;
@@ -3507,6 +3571,12 @@ impl Editor {
             match self.mode {
                 Mode::Command => self.handle_command(&mut reader, key)?,
                 Mode::Insert | Mode::Replace => self.handle_insert(&mut reader, key, special)?,
+            }
+            // Taken after the command rather than before it, so a resize seen
+            // while a multi-key command was blocking for its operand counts
+            // towards this frame instead of the next one.
+            if reader.take_resized() {
+                self.force_redraw();
             }
             self.refresh_size();
             self.render(None)?;
@@ -5199,6 +5269,81 @@ mod terminal_event_tests {
         editor.render_to(&mut changed, None).expect("changed frame");
         assert!(changed.windows(6).any(|bytes| bytes == b"\x1b[1;1H"));
         assert!(!changed.windows(6).any(|bytes| bytes == b"\x1b[2;1H"));
+    }
+
+    /// A resize the editor never noticed leaves the terminal holding rows this
+    /// editor did not write, and the differential renderer would keep skipping
+    /// them because the buffer behind them never changed.
+    #[test]
+    fn a_forced_redraw_repaints_every_row_over_an_unchanged_buffer() {
+        let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        editor
+            .render_to(&mut Vec::new(), None)
+            .expect("first frame");
+
+        let mut unchanged = Vec::new();
+        editor
+            .render_to(&mut unchanged, None)
+            .expect("unchanged frame");
+        assert!(!unchanged.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        // No row was rewritten, so nothing cleared to end of line either. The
+        // trailing cursor placement is all an unchanged frame emits.
+        assert!(!unchanged.windows(3).any(|bytes| bytes == b"\x1b[K"));
+
+        editor.force_redraw();
+        let mut repainted = Vec::new();
+        editor
+            .render_to(&mut repainted, None)
+            .expect("forced frame");
+        assert!(repainted.starts_with(b"\x1b[2J\x1b[H"));
+        assert!(repainted.windows(3).any(|bytes| bytes == b"\x1b[K"));
+        // Row 1 is skipped: its positioning is indistinguishable from the
+        // trailing cursor placement, which every frame emits.
+        for row in 2..=4 {
+            let cursor_to_row = format!("\x1b[{row};1H").into_bytes();
+            assert!(
+                repainted
+                    .windows(cursor_to_row.len())
+                    .any(|bytes| bytes == cursor_to_row),
+                "row {row} was not repainted"
+            );
+        }
+    }
+
+    /// Vi's `^L`. Without it there is no way back from a screen the editor did
+    /// not corrupt and cannot detect.
+    #[test]
+    fn control_l_forces_a_full_redraw() {
+        let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+        editor.screen_rows = 4;
+        editor.screen_cols = 20;
+        editor
+            .render_to(&mut Vec::new(), None)
+            .expect("first frame");
+
+        editor.execute_keys(b"\x0c").expect("redraw command");
+        let mut repainted = Vec::new();
+        editor
+            .render_to(&mut repainted, None)
+            .expect("redrawn frame");
+
+        assert!(repainted.starts_with(b"\x1b[2J\x1b[H"));
+        assert!(repainted.windows(6).any(|bytes| bytes == b"\x1b[1;1H"));
+        assert!(repainted.windows(6).any(|bytes| bytes == b"\x1b[2;1H"));
+    }
+
+    /// The run loop asks once per frame and has to see the resize exactly once,
+    /// or every later frame would repaint in full.
+    #[test]
+    fn a_recorded_resize_is_reported_once() {
+        let mut reader = KeyReader::from_bytes(b"");
+        assert!(!reader.take_resized());
+
+        reader.resized = true;
+        assert!(reader.take_resized());
+        assert!(!reader.take_resized());
     }
 
     #[test]
