@@ -1856,7 +1856,9 @@ impl Editor {
     /// Display columns at which the screen rows of `line` start, for at most
     /// `limit` rows. Under `:set linebreak` a wrapped row ends after the last
     /// `breakat` character that fits, as in Vim, so rows can be narrower than
-    /// the screen. A word too long for a row still breaks anywhere.
+    /// the screen. A word too long for a row still breaks anywhere. Blanks
+    /// that overflow a row hang off its end unseen, so no row after the first
+    /// starts with one; a row can then span more than `width` columns.
     fn row_starts(&self, line: usize, limit: usize) -> Vec<usize> {
         let limit = limit.max(1);
         if !self.wrap {
@@ -1871,10 +1873,25 @@ impl Editor {
         let mut starts = vec![0];
         let mut row_start = 0;
         let mut last_break = None;
+        let mut hanging = false;
         let mut display_column = 0;
+        let blank = |byte: u8| byte == b' ' || byte == b'\t';
         for &byte in &self.lines[line] {
             let end = display_column + fragment_len(byte, display_column, self.tabstop);
-            while end - row_start > width {
+            if hanging && !blank(byte) {
+                if starts.len() == limit {
+                    return starts;
+                }
+                starts.push(display_column);
+                row_start = display_column;
+                last_break = None;
+                hanging = false;
+            }
+            while !hanging && end - row_start > width {
+                if blank(byte) {
+                    hanging = true;
+                    break;
+                }
                 if starts.len() == limit {
                     return starts;
                 }
@@ -1887,11 +1904,14 @@ impl Editor {
                 last_break = Some(end);
             }
         }
-        if line == self.row
-            && starts.len() < limit
-            && self.line_display_width(&self.lines[line], self.col) >= row_start + width
-        {
-            starts.push(row_start + width);
+        if line == self.row && starts.len() < limit {
+            // Make room for an insert cursor past the end of a full row.
+            let cursor = self.line_display_width(&self.lines[line], self.col);
+            if hanging && cursor >= display_column {
+                starts.push(display_column);
+            } else if !hanging && cursor >= row_start + width {
+                starts.push(row_start + width);
+            }
         }
         starts
     }
@@ -1966,7 +1986,9 @@ impl Editor {
         while line < self.lines.len() {
             let starts = self.row_starts(line, segment + 2);
             if let Some(&start) = starts.get(segment) {
-                let row_width = starts.get(segment + 1).map_or(width, |next| next - start);
+                let row_width = starts
+                    .get(segment + 1)
+                    .map_or(width, |next| (next - start).min(width));
                 return Some((line, start, row_width));
             }
             segment -= starts.len();
@@ -2528,7 +2550,10 @@ impl Editor {
                 continue;
             }
             let left = starts[segment];
-            let row_width = starts.get(segment + 1).map_or(width, |next| next - left);
+            // Hanging blanks past the screen edge are not drawn.
+            let row_width = starts
+                .get(segment + 1)
+                .map_or(width, |next| (next - left).min(width));
             if segment > 0 {
                 row.resize(self.number_column_width(), b' ');
             } else if self.number {
@@ -6844,6 +6869,44 @@ mod terminal_event_tests {
         editor.execute_ex("set nolinebreak");
         let (rows, _) = frame_rows(&mut editor);
         assert_eq!(rows[1], b"ij k");
+    }
+
+    #[test]
+    fn linebreak_rows_never_start_with_the_blank_they_broke_at() {
+        // "cd." ends exactly at the edge, so the blank after it overflows.
+        let mut editor = wrapped_editor(b"ab cd.  ef\tgh", 5, 6);
+        editor.execute_ex("set lbr nu");
+        editor.screen_cols = 10;
+
+        let (rows, _) = frame_rows(&mut editor);
+        assert_eq!(
+            rows,
+            vec![
+                b"  1 ab cd.".to_vec(),
+                b"    ef    ".to_vec(),
+                b"    gh".to_vec(),
+                b"~".to_vec(),
+            ]
+        );
+
+        // A cursor on a hanging blank stays at the end of its row.
+        editor
+            .execute_keys(b"6|")
+            .expect("move onto the hanging blank");
+        let (_, rendered) = frame_rows(&mut editor);
+        assert!(ends_with_cursor(&rendered, 1, 10));
+
+        // Typing after a hanging blank continues on the next row.
+        let mut editor = wrapped_editor(b"ab cd", 4, 5);
+        editor.execute_ex("set lbr");
+        editor.execute_keys(b"A x").expect("append past the edge");
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(rows, vec![b"ab cd".to_vec(), b"x".to_vec(), b"~".to_vec()]);
+        assert!(ends_with_cursor(&rendered, 2, 2));
+        editor.execute_keys(b"\x08").expect("erase the typed word");
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(rows, vec![b"ab cd".to_vec(), Vec::new(), b"~".to_vec()]);
+        assert!(ends_with_cursor(&rendered, 2, 1));
     }
 
     #[test]
