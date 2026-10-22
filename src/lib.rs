@@ -734,6 +734,9 @@ pub struct Editor {
     trailing_newline: bool,
     mode: Mode,
     number: bool,
+    wrap: bool,
+    linebreak: bool,
+    textwidth: usize,
     autoindent: bool,
     expandtab: bool,
     flash: bool,
@@ -767,6 +770,9 @@ pub struct Editor {
     screen_cols: usize,
     screen_top: usize,
     screen_left: usize,
+    /// Rows of the `screen_top` line hidden above the screen. Only a wrapped
+    /// cursor line taller than the screen scrolls within itself.
+    wrap_skip: usize,
     rendered_rows: Vec<Vec<u8>>,
     rendered_size: (usize, usize),
     selection: Option<MouseSelection>,
@@ -811,6 +817,9 @@ impl Editor {
             trailing_newline: true,
             mode: Mode::Command,
             number: false,
+            wrap: false,
+            linebreak: false,
+            textwidth: 0,
             autoindent: false,
             expandtab: false,
             flash: false,
@@ -843,6 +852,7 @@ impl Editor {
             screen_cols: 80,
             screen_top: 0,
             screen_left: 0,
+            wrap_skip: 0,
             rendered_rows: Vec::new(),
             rendered_size: (0, 0),
             selection: None,
@@ -1059,6 +1069,7 @@ impl Editor {
         self.col = 0;
         self.screen_top = 0;
         self.screen_left = 0;
+        self.wrap_skip = 0;
         self.selection = None;
         self.mouse_viewport_scrolled = false;
         self.last_mouse_click = None;
@@ -1815,6 +1826,179 @@ impl Editor {
         }
     }
 
+    /// Screen rows `line` takes, capped at `limit`. Without `:set wrap` every
+    /// line takes one row. A wrapped cursor line also makes room for an insert
+    /// cursor sitting just past a row that is exactly full, as Vim does.
+    fn line_rows(&self, line: usize, limit: usize) -> usize {
+        let limit = limit.max(1);
+        if !self.wrap {
+            return 1;
+        }
+        if self.linebreak {
+            return self.row_starts(line, limit).len();
+        }
+        let width = self.horizontal_width();
+        let mut display_column = 0;
+        for &byte in &self.lines[line] {
+            display_column += fragment_len(byte, display_column, self.tabstop);
+            // Stop early so a huge line costs no more than the rows asked for.
+            if display_column / width >= limit {
+                return limit;
+            }
+        }
+        let mut rows = display_column.div_ceil(width).max(1);
+        if line == self.row {
+            rows = rows.max(self.line_display_width(&self.lines[line], self.col) / width + 1);
+        }
+        rows.min(limit)
+    }
+
+    /// Display columns at which the screen rows of `line` start, for at most
+    /// `limit` rows. Under `:set linebreak` a wrapped row ends after the last
+    /// `breakat` character that fits, as in Vim, so rows can be narrower than
+    /// the screen. A word too long for a row still breaks anywhere.
+    fn row_starts(&self, line: usize, limit: usize) -> Vec<usize> {
+        let limit = limit.max(1);
+        if !self.wrap {
+            return vec![self.screen_left];
+        }
+        let width = self.horizontal_width();
+        if !self.linebreak {
+            return (0..self.line_rows(line, limit))
+                .map(|row| row * width)
+                .collect();
+        }
+        let mut starts = vec![0];
+        let mut row_start = 0;
+        let mut last_break = None;
+        let mut display_column = 0;
+        for &byte in &self.lines[line] {
+            let end = display_column + fragment_len(byte, display_column, self.tabstop);
+            while end - row_start > width {
+                if starts.len() == limit {
+                    return starts;
+                }
+                let next = last_break.take().unwrap_or(row_start + width);
+                starts.push(next);
+                row_start = next;
+            }
+            display_column = end;
+            if BREAKAT.contains(&byte) {
+                last_break = Some(end);
+            }
+        }
+        if line == self.row
+            && starts.len() < limit
+            && self.line_display_width(&self.lines[line], self.col) >= row_start + width
+        {
+            starts.push(row_start + width);
+        }
+        starts
+    }
+
+    /// The wrapped row of the cursor line that holds the cursor, and the
+    /// cursor's column within that row.
+    fn cursor_wrapped_position(&self) -> (usize, usize) {
+        let cursor = self.line_display_width(&self.lines[self.row], self.col);
+        if !self.linebreak {
+            let width = self.horizontal_width();
+            return (cursor / width, cursor % width);
+        }
+        let starts = self.row_starts(self.row, usize::MAX);
+        let segment = starts
+            .partition_point(|start| *start <= cursor)
+            .saturating_sub(1);
+        (segment, cursor - starts[segment])
+    }
+
+    /// The first line to show so that the lines through `line` take at most
+    /// `rows` screen rows. `line` itself is always kept, even if it is taller.
+    fn wrapped_top_for(&self, line: usize, rows: usize) -> usize {
+        let body = self.body_rows();
+        let mut used = self.line_rows(line, body);
+        let mut top = line;
+        while top > 0 {
+            let above = self.line_rows(top - 1, body);
+            if used + above > rows {
+                break;
+            }
+            used += above;
+            top -= 1;
+        }
+        top
+    }
+
+    /// The last line shown in full, or `screen_top` when not even that fits.
+    fn last_visible_line(&self) -> usize {
+        let last_line = self.lines.len().saturating_sub(1);
+        let body = self.body_rows();
+        if !self.wrap {
+            return self
+                .screen_top
+                .saturating_add(body.saturating_sub(1))
+                .min(last_line);
+        }
+        let mut line = self.screen_top;
+        let mut used = self
+            .line_rows(line, self.wrap_skip.saturating_add(body))
+            .saturating_sub(self.wrap_skip);
+        while line < last_line {
+            used += self.line_rows(line + 1, body);
+            if used > body {
+                break;
+            }
+            line += 1;
+        }
+        line
+    }
+
+    /// The line shown on `screen_row`, the display column of its first text
+    /// cell, and how many columns of the line the row shows. `None` past the
+    /// end of the buffer.
+    fn screen_row_source(&self, screen_row: usize) -> Option<(usize, usize, usize)> {
+        let width = self.horizontal_width();
+        if !self.wrap {
+            let line = self.screen_top.saturating_add(screen_row);
+            return (line < self.lines.len()).then_some((line, self.screen_left, width));
+        }
+        let mut line = self.screen_top;
+        let mut segment = self.wrap_skip.saturating_add(screen_row);
+        while line < self.lines.len() {
+            let starts = self.row_starts(line, segment + 2);
+            if let Some(&start) = starts.get(segment) {
+                let row_width = starts.get(segment + 1).map_or(width, |next| next - start);
+                return Some((line, start, row_width));
+            }
+            segment -= starts.len();
+            line += 1;
+        }
+        None
+    }
+
+    /// How many whole lines scrolling by `rows` screen rows passes over. A
+    /// line taller than `rows` still scrolls, so paging never gets stuck.
+    fn wrapped_scroll_lines(&self, rows: usize, direction: i32) -> usize {
+        let body = self.body_rows();
+        let mut lines = 0;
+        let mut used = 0;
+        loop {
+            let line = if direction < 0 {
+                self.screen_top.checked_sub(lines + 1)
+            } else {
+                Some(self.screen_top + lines).filter(|line| *line < self.lines.len())
+            };
+            let Some(line) = line else {
+                break;
+            };
+            used += self.line_rows(line, body);
+            if used > rows {
+                break;
+            }
+            lines += 1;
+        }
+        lines.max(rows.min(1))
+    }
+
     fn clear_mouse_selection(&mut self) {
         self.selection = None;
         self.mouse_viewport_scrolled = false;
@@ -1919,22 +2103,25 @@ impl Editor {
             // into a selection of the last file line.
             return None;
         }
-        let line = self.screen_top.saturating_add(screen_row);
-        let line = line.min(self.lines.len().saturating_sub(1));
-        if self.screen_top.saturating_add(screen_row) >= self.lines.len() {
+        let Some((line, first_column, row_width)) = self.screen_row_source(screen_row) else {
+            let line = self.lines.len() - 1;
             return Some(SelectionPoint {
                 line,
                 offset: self.lines[line].len(),
             });
-        }
+        };
         let column = mouse.column as usize;
         let gutter = self.number_column_width();
-        if column < gutter {
+        if column < gutter && !self.wrap {
             return Some(SelectionPoint { line, offset: 0 });
         }
-        let display_column = self
-            .screen_left
-            .saturating_add(column.saturating_sub(gutter));
+        // A wrapped row's gutter selects from the start of that row's text,
+        // and the blank after a linebreak selects the row's last character.
+        let display_column = first_column.saturating_add(
+            column
+                .saturating_sub(gutter)
+                .min(row_width.saturating_sub(1)),
+        );
         Some(SelectionPoint {
             line,
             offset: byte_offset_at_display_column(&self.lines[line], display_column, self.tabstop),
@@ -1970,7 +2157,9 @@ impl Editor {
 
         let column = mouse.column as usize;
         let gutter = self.number_column_width();
-        if column <= gutter {
+        if self.wrap {
+            // Wrapped lines have nothing hidden to either side.
+        } else if column <= gutter {
             self.screen_left = self.screen_left.saturating_sub(1);
         } else if column.saturating_add(1) >= self.screen_cols {
             self.screen_left = self.screen_left.saturating_add(1);
@@ -2127,6 +2316,7 @@ impl Editor {
                 self.mouse_viewport_scrolled = true;
                 None
             }
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight if self.wrap => None,
             MouseEventKind::ScrollLeft => {
                 self.screen_left = self.screen_left.saturating_sub(3);
                 self.mouse_viewport_scrolled = true;
@@ -2146,6 +2336,9 @@ impl Editor {
         let body = self.body_rows();
         if self.selection.is_some() || self.mouse_viewport_scrolled {
             self.screen_top = self.screen_top.min(last_line);
+            if self.screen_top != self.row {
+                self.wrap_skip = 0;
+            }
             return;
         }
         let half = body / 2;
@@ -2172,6 +2365,11 @@ impl Editor {
             }
         }
 
+        if self.wrap {
+            self.sync_wrapped_screen();
+            return;
+        }
+        self.wrap_skip = 0;
         let cursor = self.line_display_width(&self.lines[self.row], self.col);
         let width = self.horizontal_width();
         if cursor < self.screen_left {
@@ -2185,17 +2383,49 @@ impl Editor {
         }
     }
 
+    /// Finishes [`Editor::sync_screen`] for `:set wrap`, where the line-based
+    /// scrolling above can still leave the cursor line partly below the
+    /// screen, and nothing ever scrolls sideways.
+    fn sync_wrapped_screen(&mut self) {
+        self.screen_left = 0;
+        let body = self.body_rows();
+        if self.row != self.screen_top {
+            self.wrap_skip = 0;
+        }
+        if self.row > self.last_visible_line() {
+            self.screen_top = self.screen_top.max(self.wrapped_top_for(self.row, body));
+        }
+        if self.row != self.screen_top {
+            self.wrap_skip = 0;
+            return;
+        }
+        // Only a cursor line taller than the screen gets here with rows to
+        // hide: scroll within it just far enough to show the cursor.
+        let rows = self.line_rows(self.row, self.wrap_skip.saturating_add(body));
+        self.wrap_skip = self.wrap_skip.min(rows.saturating_sub(body));
+        let (segment, _) = self.cursor_wrapped_position();
+        if segment < self.wrap_skip {
+            self.wrap_skip = segment;
+        } else if segment >= self.wrap_skip + body {
+            self.wrap_skip = segment + 1 - body;
+        }
+    }
+
     fn scroll_screen(&mut self, count: usize, direction: i32) {
         let last_line = self.lines.len().saturating_sub(1);
+        // Scroll counts are screen rows. A wrapped line can take several.
+        let count = if self.wrap {
+            self.wrapped_scroll_lines(count, direction)
+        } else {
+            count
+        };
+        self.wrap_skip = 0;
         if direction < 0 {
             self.screen_top = self.screen_top.saturating_sub(count);
         } else {
             self.screen_top = self.screen_top.saturating_add(count).min(last_line);
         }
-        let end = self
-            .screen_top
-            .saturating_add(self.body_rows().saturating_sub(1))
-            .min(last_line);
+        let end = self.last_visible_line();
         self.row = self.row.clamp(self.screen_top, end);
         if direction > 0 && self.row == last_line {
             self.col = self.lines[self.row].len().saturating_sub(1);
@@ -2272,15 +2502,36 @@ impl Editor {
         let mut preview_cursor = HighlightCursor::new(&self.syntax_preview_highlights);
         let preview_range = self.syntax_preview_range;
         let mut frame = Vec::with_capacity(self.screen_rows);
+        // With `:set wrap` a line spans one screen row per entry of
+        // `starts`, of which this frame is drawing `segment`. Without it every
+        // line is the single segment starting at `screen_left`.
+        let mut index = self.screen_top;
+        let mut segment = self.wrap_skip;
+        let mut starts = if index < self.lines.len() {
+            // One row past the screen, so the bottom row knows where it ends.
+            self.row_starts(index, segment.saturating_add(body) + 1)
+        } else {
+            Vec::new()
+        };
         for screen_line in 0..body {
-            let index = self.screen_top + screen_line;
             let mut row = Vec::new();
             if index >= self.lines.len() {
                 row.extend_from_slice(b"~\x1b[K");
                 frame.push(row);
                 continue;
             }
-            if self.number {
+            // Like Vim, mark a wrapped line that does not fit at the bottom
+            // with `@` rather than show part of it.
+            if segment == 0 && screen_line > 0 && screen_line + starts.len() > body {
+                row.extend_from_slice(b"@\x1b[K");
+                frame.push(row);
+                continue;
+            }
+            let left = starts[segment];
+            let row_width = starts.get(segment + 1).map_or(width, |next| next - left);
+            if segment > 0 {
+                row.resize(self.number_column_width(), b' ');
+            } else if self.number {
                 let style = if index == self.row {
                     current_line_number_style
                 } else {
@@ -2302,8 +2553,8 @@ impl Editor {
                     &mut highlight_cursor,
                     &mut preview_cursor,
                     preview_range,
-                    self.screen_left,
-                    width,
+                    left,
+                    row_width,
                     self.tabstop,
                     selected,
                 )?;
@@ -2311,14 +2562,22 @@ impl Editor {
                 write_plain_line_with_selection(
                     &mut row,
                     &self.lines[index],
-                    self.screen_left,
-                    width,
+                    left,
+                    row_width,
                     self.tabstop,
                     selected,
                 )?;
             }
             row.extend_from_slice(b"\x1b[K");
             frame.push(row);
+            segment += 1;
+            if segment >= starts.len() {
+                index += 1;
+                segment = 0;
+                if index < self.lines.len() {
+                    starts = self.row_starts(index, body + 1);
+                }
+            }
         }
         let mut status_row = Vec::new();
         status_row.extend_from_slice(b"\x1b[K");
@@ -2370,10 +2629,25 @@ impl Editor {
                     + 1,
             )
         } else {
-            let screen_row = self.row.saturating_sub(self.screen_top) + 1;
-            let mut screen_col = self
-                .line_display_width(&self.lines[self.row], self.col)
-                .saturating_sub(self.screen_left);
+            let (screen_row, mut screen_col) = if self.wrap {
+                // Each line above takes at least one row, so `body` lines are
+                // enough to reach the bottom of the screen.
+                let rows_above: usize = (self.screen_top..self.row)
+                    .take(body)
+                    .map(|line| self.line_rows(line, body))
+                    .sum();
+                let (segment, column) = self.cursor_wrapped_position();
+                (
+                    (rows_above + segment).saturating_sub(self.wrap_skip) + 1,
+                    column,
+                )
+            } else {
+                (
+                    self.row.saturating_sub(self.screen_top) + 1,
+                    self.line_display_width(&self.lines[self.row], self.col)
+                        .saturating_sub(self.screen_left),
+                )
+            };
             screen_col += self.number_column_width();
             (
                 screen_row.min(body).max(1),
@@ -2876,7 +3150,15 @@ impl Editor {
                     }
                 }
             }
-            name if name.len() > 1 && command_prefix(name, "set") => self.set_options(args),
+            name if name.len() > 1 && command_prefix(name, "set") => {
+                // A trailing `!` toggles the last option (`:set wrap!`)
+                // rather than forcing the command.
+                if force && !args.is_empty() && command.ends_with('!') {
+                    self.set_options(&format!("{args}!"));
+                } else {
+                    self.set_options(args);
+                }
+            }
             name if command_prefix(name, "file") => {
                 if addresses.is_some() {
                     self.set_error("No address allowed on this command");
@@ -3014,21 +3296,35 @@ impl Editor {
             return;
         }
         for option in args.split_whitespace() {
+            // `name` sets a boolean option, `noname` clears it and `name!`
+            // toggles it, as in Vim.
+            if let Some(flag) = self.boolean_option(option) {
+                *flag = true;
+                continue;
+            }
+            if let Some(flag) = option
+                .strip_suffix('!')
+                .and_then(|name| self.boolean_option(name))
+            {
+                *flag = !*flag;
+                continue;
+            }
+            if let Some(flag) = option
+                .strip_prefix("no")
+                .and_then(|name| self.boolean_option(name))
+            {
+                *flag = false;
+                continue;
+            }
             match option {
-                "number" | "nu" => self.number = true,
-                "nonumber" | "nonu" => self.number = false,
-                "autoindent" | "ai" => self.autoindent = true,
-                "noautoindent" | "noai" => self.autoindent = false,
-                "expandtab" | "et" => self.expandtab = true,
-                "noexpandtab" | "noet" => self.expandtab = false,
-                "flash" | "fl" => self.flash = true,
-                "noflash" | "nofl" => self.flash = false,
-                "ignorecase" | "ic" => self.ignorecase = true,
-                "noignorecase" | "noic" => self.ignorecase = false,
-                "showmatch" | "sm" => self.showmatch = true,
-                "noshowmatch" | "nosm" => self.showmatch = false,
-                "readonly" | "ro" => self.readonly = true,
-                "noreadonly" | "noro" => self.readonly = false,
+                value if value.starts_with("textwidth=") || value.starts_with("tw=") => {
+                    let (_, width) = value.split_once('=').unwrap_or_default();
+                    if let Ok(n) = width.parse::<usize>() {
+                        self.textwidth = n;
+                    } else {
+                        self.set_error(format!("bad option: {}", option));
+                    }
+                }
                 value if value.starts_with("tabstop=") => {
                     if let Ok(n) = value[8..].parse::<usize>() {
                         if (1..=32).contains(&n) {
@@ -3043,6 +3339,21 @@ impl Editor {
                 _ => self.set_error(format!("bad option: {}", option)),
             }
         }
+    }
+
+    fn boolean_option(&mut self, name: &str) -> Option<&mut bool> {
+        Some(match name {
+            "number" | "nu" => &mut self.number,
+            "wrap" => &mut self.wrap,
+            "linebreak" | "lbr" => &mut self.linebreak,
+            "autoindent" | "ai" => &mut self.autoindent,
+            "expandtab" | "et" => &mut self.expandtab,
+            "flash" | "fl" => &mut self.flash,
+            "ignorecase" | "ic" => &mut self.ignorecase,
+            "showmatch" | "sm" => &mut self.showmatch,
+            "readonly" | "ro" => &mut self.readonly,
+            _ => return None,
+        })
     }
 
     fn substitute(&mut self, args: &str, addresses: Option<(usize, usize)>) {
@@ -3472,12 +3783,13 @@ impl Editor {
                 self.col = self.col.min(self.lines[self.row].len().saturating_sub(1));
             }
             b'M' => {
-                self.row = (self.screen_top + self.body_rows() / 2).min(self.lines.len() - 1);
+                self.row = self
+                    .screen_row_source(self.body_rows() / 2)
+                    .map_or(self.lines.len() - 1, |(line, _, _)| line);
                 self.col = self.col.min(self.lines[self.row].len().saturating_sub(1));
             }
             b'L' => {
-                self.row = (self.screen_top + self.body_rows().saturating_sub(1))
-                    .min(self.lines.len() - 1);
+                self.row = self.last_visible_line();
                 self.col = self.col.min(self.lines[self.row].len().saturating_sub(1));
             }
             b'+' => {
@@ -3933,6 +4245,9 @@ impl Editor {
                 self.replace_bytes(self.row, self.col..self.col, vec![byte]);
             }
             self.col += 1;
+            if self.textwidth > 0 && byte != b' ' {
+                self.wrap_at_textwidth();
+            }
             if !self.replaying {
                 self.last_change.push(byte);
             }
@@ -3946,6 +4261,58 @@ impl Editor {
         }
         let _ = reader;
         Ok(())
+    }
+
+    /// Vim's auto-wrap for `:set textwidth`: once the character just typed
+    /// ends past the margin, break the line at the last blank before the
+    /// cursor that keeps the line within the margin (or the first blank, when
+    /// none does), carrying the rest with any autoindent onto a new line.
+    fn wrap_at_textwidth(&mut self) {
+        let blank = |byte: u8| byte == b' ' || byte == b'\t';
+        loop {
+            let line = &self.lines[self.row];
+            if self.line_display_width(line, self.col) <= self.textwidth {
+                return;
+            }
+            let indent = line.iter().take_while(|byte| blank(**byte)).count();
+            let mut first = None;
+            let mut fitting = None;
+            let mut display_column = self.line_display_width(line, indent);
+            let mut offset = indent;
+            while offset < self.col {
+                if blank(line[offset]) {
+                    let start = offset;
+                    let fits = display_column <= self.textwidth;
+                    while offset < self.col && blank(line[offset]) {
+                        display_column += fragment_len(line[offset], display_column, self.tabstop);
+                        offset += 1;
+                    }
+                    first.get_or_insert((start, offset));
+                    if fits {
+                        fitting = Some((start, offset));
+                    }
+                } else {
+                    display_column += fragment_len(line[offset], display_column, self.tabstop);
+                    offset += 1;
+                }
+            }
+            // A blank right before the cursor has nothing after it to carry.
+            let Some((start, end)) = fitting.or(first).filter(|(_, end)| *end < self.col) else {
+                return;
+            };
+            let head = line[..start].to_vec();
+            let mut tail = if self.autoindent {
+                line[..indent].to_vec()
+            } else {
+                Vec::new()
+            };
+            let carried = tail.len();
+            tail.extend_from_slice(&line[end..]);
+            let old_row = self.row;
+            self.row += 1;
+            self.col = self.col - end + carried;
+            self.replace_lines(old_row..old_row + 1, vec![head, tail]);
+        }
     }
 
     pub fn run(&mut self) -> io::Result<()> {
@@ -4200,6 +4567,9 @@ impl<'a> HighlightCursor<'a> {
             .filter(|style| !style.is_plain())
     }
 }
+
+/// Vim's default `breakat`: the characters `:set linebreak` may wrap after.
+const BREAKAT: &[u8] = b" \t!@*-+;:,./?";
 
 fn fragment_len(byte: u8, display_column: usize, tabstop: usize) -> usize {
     if byte == b'\t' {
@@ -6230,6 +6600,268 @@ mod terminal_event_tests {
         assert!(repainted.starts_with(b"\x1b[2J\x1b[H"));
         assert!(repainted.windows(6).any(|bytes| bytes == b"\x1b[1;1H"));
         assert!(repainted.windows(6).any(|bytes| bytes == b"\x1b[2;1H"));
+    }
+
+    fn wrapped_editor(data: &[u8], rows: usize, cols: usize) -> Editor {
+        let mut editor = Editor::from_bytes(data, None, false);
+        editor.screen_rows = rows;
+        editor.screen_cols = cols;
+        editor.execute_ex("set wrap");
+        editor
+    }
+
+    fn frame_rows(editor: &mut Editor) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let mut rendered = Vec::new();
+        editor.render_to(&mut rendered, None).expect("render frame");
+        let rows = editor
+            .rendered_rows
+            .iter()
+            .take(editor.body_rows())
+            .map(|row| row.strip_suffix(b"\x1b[K").unwrap_or(row).to_vec())
+            .collect();
+        (rows, rendered)
+    }
+
+    fn ends_with_cursor(rendered: &[u8], row: usize, col: usize) -> bool {
+        rendered.ends_with(format!("\x1b[?25h\x1b[{row};{col}H").as_bytes())
+    }
+
+    #[test]
+    fn wrapped_lines_continue_on_the_next_rows_with_a_blank_gutter() {
+        let mut editor = wrapped_editor(b"abcdefghijklmn\nxy", 6, 9);
+        editor.execute_ex("set nu");
+
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(
+            rows,
+            vec![
+                b"  1 abcde".to_vec(),
+                b"    fghij".to_vec(),
+                b"    klmn".to_vec(),
+                b"  2 xy".to_vec(),
+                b"~".to_vec(),
+            ]
+        );
+        assert!(ends_with_cursor(&rendered, 1, 5));
+
+        editor
+            .execute_keys(b"$")
+            .expect("move to the end of the line");
+        let (_, rendered) = frame_rows(&mut editor);
+        assert!(ends_with_cursor(&rendered, 3, 8));
+
+        editor.execute_ex("set nowrap");
+        let (rows, _) = frame_rows(&mut editor);
+        assert_eq!(rows[0], b"  1 jklmn");
+    }
+
+    #[test]
+    fn wrapping_splits_tabs_and_control_bytes_across_rows() {
+        let mut editor = wrapped_editor(b"abc\tde\x01f", 4, 5);
+
+        let (rows, _) = frame_rows(&mut editor);
+        assert_eq!(
+            rows,
+            vec![b"abc  ".to_vec(), b"   de".to_vec(), b"^Af".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_line_that_does_not_fit_is_shown_as_at_signs() {
+        let mut editor = wrapped_editor(b"one\nabcdefghijkl\nlast", 4, 5);
+
+        let (rows, _) = frame_rows(&mut editor);
+        assert_eq!(rows, vec![b"one".to_vec(), b"@".to_vec(), b"@".to_vec()]);
+        assert_eq!(editor.last_visible_line(), 0);
+
+        editor
+            .execute_keys(b"j")
+            .expect("move onto the wrapped line");
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(editor.screen_top, 1);
+        assert_eq!(
+            rows,
+            vec![b"abcde".to_vec(), b"fghij".to_vec(), b"kl".to_vec()]
+        );
+        assert!(ends_with_cursor(&rendered, 1, 1));
+
+        editor
+            .execute_keys(b"j")
+            .expect("move below the wrapped line");
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(editor.screen_top, 2);
+        assert_eq!(rows[0], b"last");
+        assert!(ends_with_cursor(&rendered, 1, 1));
+    }
+
+    #[test]
+    fn a_cursor_line_taller_than_the_screen_scrolls_within_itself() {
+        let line = (b'a'..=b'z').collect::<Vec<_>>();
+        let mut editor = wrapped_editor(&line, 4, 5);
+
+        editor
+            .execute_keys(b"$")
+            .expect("move to the end of the line");
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(editor.wrap_skip, 3);
+        assert_eq!(
+            rows,
+            vec![b"pqrst".to_vec(), b"uvwxy".to_vec(), b"z".to_vec()]
+        );
+        assert!(ends_with_cursor(&rendered, 3, 1));
+        assert_eq!(
+            editor.mouse_point(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)),
+            Some(SelectionPoint {
+                line: 0,
+                offset: 21
+            })
+        );
+
+        editor
+            .execute_keys(b"0")
+            .expect("move to the start of the line");
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(editor.wrap_skip, 0);
+        assert_eq!(rows[0], b"abcde");
+        assert!(ends_with_cursor(&rendered, 1, 1));
+    }
+
+    #[test]
+    fn insert_at_the_end_of_an_exactly_full_row_moves_to_a_new_row() {
+        let mut editor = wrapped_editor(b"abcde\nnext", 5, 5);
+
+        editor.execute_keys(b"A").expect("append to the line");
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(
+            rows,
+            vec![
+                b"abcde".to_vec(),
+                Vec::new(),
+                b"next".to_vec(),
+                b"~".to_vec()
+            ]
+        );
+        assert!(ends_with_cursor(&rendered, 2, 1));
+    }
+
+    #[test]
+    fn wrapped_mouse_points_map_continuation_rows_to_their_line() {
+        let mut editor = wrapped_editor(b"abcdefghij\nxyz", 5, 9);
+        editor.execute_ex("set nu");
+
+        let press = |column, row| mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+        assert_eq!(
+            editor.mouse_point(press(5, 1)),
+            Some(SelectionPoint { line: 0, offset: 6 })
+        );
+        assert_eq!(
+            editor.mouse_point(press(0, 1)),
+            Some(SelectionPoint { line: 0, offset: 5 })
+        );
+        assert_eq!(
+            editor.mouse_point(press(5, 2)),
+            Some(SelectionPoint { line: 1, offset: 1 })
+        );
+        assert_eq!(
+            editor.mouse_point(press(5, 3)),
+            Some(SelectionPoint { line: 1, offset: 3 })
+        );
+
+        editor.handle_mouse_event(mouse(MouseEventKind::ScrollRight, 3, 0));
+        assert_eq!(editor.screen_left, 0);
+    }
+
+    #[test]
+    fn wrapped_paging_and_screen_motions_count_screen_rows() {
+        let mut data = Vec::new();
+        for line in 0..10 {
+            data.extend_from_slice(format!("line{line}-long\n").as_bytes());
+        }
+        // Every line takes two rows of a five-column screen.
+        let mut editor = wrapped_editor(&data, 7, 5);
+        assert_eq!(editor.last_visible_line(), 2);
+
+        editor
+            .execute_keys(b"L")
+            .expect("move to the last visible line");
+        assert_eq!(editor.cursor(), (2, 0));
+        editor.execute_keys(b"M").expect("move to the middle line");
+        assert_eq!(editor.cursor(), (1, 0));
+
+        editor.execute_keys(b"\x06").expect("page forward");
+        assert_eq!(editor.screen_top, 2);
+        assert_eq!(editor.cursor(), (2, 0));
+
+        editor.execute_keys(b"G").expect("move to the last line");
+        frame_rows(&mut editor);
+        assert_eq!(editor.cursor().0, 9);
+        assert_eq!(editor.last_visible_line(), 9);
+        assert_eq!(editor.screen_top, 7);
+    }
+
+    #[test]
+    fn linebreak_wraps_after_the_last_breakat_character_that_fits() {
+        let mut editor = wrapped_editor(b"one two three-four\nnext", 6, 8);
+        editor.execute_ex("set lbr");
+
+        let (rows, rendered) = frame_rows(&mut editor);
+        assert_eq!(
+            rows,
+            vec![
+                b"one two ".to_vec(),
+                b"three-".to_vec(),
+                b"four".to_vec(),
+                b"next".to_vec(),
+                b"~".to_vec(),
+            ]
+        );
+        assert!(ends_with_cursor(&rendered, 1, 1));
+
+        editor
+            .execute_keys(b"fh")
+            .expect("move onto the second row");
+        let (_, rendered) = frame_rows(&mut editor);
+        assert!(ends_with_cursor(&rendered, 2, 2));
+
+        // The blank after a broken row selects the row's last character.
+        assert_eq!(
+            editor.mouse_point(mouse(MouseEventKind::Down(MouseButton::Left), 7, 1)),
+            Some(SelectionPoint {
+                line: 0,
+                offset: 13
+            })
+        );
+
+        // A word longer than a row still breaks at the screen edge.
+        let mut editor = wrapped_editor(b"abcdefghij k", 4, 8);
+        editor.execute_ex("set linebreak");
+        let (rows, _) = frame_rows(&mut editor);
+        assert_eq!(
+            rows,
+            vec![b"abcdefgh".to_vec(), b"ij k".to_vec(), b"~".to_vec()]
+        );
+
+        editor.execute_ex("set nolinebreak");
+        let (rows, _) = frame_rows(&mut editor);
+        assert_eq!(rows[1], b"ij k");
+    }
+
+    #[test]
+    fn set_bang_toggles_boolean_options() {
+        let mut editor = Editor::from_bytes(b"one\n", None, false);
+
+        editor.execute_ex("set wrap!");
+        assert!(editor.wrap);
+        editor.execute_ex("set wrap! nu!");
+        assert!(!editor.wrap);
+        assert!(editor.number);
+        editor.execute_ex("set nonu lbr");
+        assert!(!editor.number);
+        assert!(editor.linebreak);
+        assert_eq!(editor.status(), "");
+
+        editor.execute_ex("set wrapx!");
+        assert_eq!(editor.status(), "bad option: wrapx!");
     }
 
     /// The run loop asks once per frame and has to see the resize exactly once,

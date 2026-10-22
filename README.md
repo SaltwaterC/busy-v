@@ -89,6 +89,10 @@ it makes porting far easier when the footprint after removing dead code is ~3klo
  * :set number for line numbering including colouring when syntax higlight is
    plugged in
  * Page Up/Down work as expected
+ * :set wrap to wrap long lines on screen, with :set linebreak to wrap them at
+   word boundaries
+ * :set textwidth=N (or tw=N) to break lines while typing past column N
+ * :set option! toggles any on/off option, e.g. :set wrap!
 
 ## Build and test
 

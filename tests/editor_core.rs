@@ -264,6 +264,57 @@ fn set_number_accepts_long_and_short_forms() {
 }
 
 #[test]
+fn textwidth_breaks_the_line_at_the_last_blank_before_the_margin() {
+    let mut editor = Editor::from_bytes(b"", None, false);
+    editor.execute_ex("set tw=10");
+    editor
+        .execute_keys(b"ione two three four\x1b")
+        .expect("type past the margin");
+    assert_eq!(editor.bytes(), b"one two\nthree four");
+    assert_eq!(editor.cursor(), (1, 9));
+
+    let mut editor = Editor::from_bytes(b"", None, false);
+    editor.execute_ex("set textwidth=8 ai");
+    editor
+        .execute_keys(b"i  aaaaaaaaaa bb cc\x1b")
+        .expect("type a word longer than the margin");
+    assert_eq!(editor.bytes(), b"  aaaaaaaaaa\n  bb cc");
+
+    let mut editor = Editor::from_bytes(b"", None, false);
+    editor.execute_ex("set tw=0");
+    editor
+        .execute_keys(b"ione two three four\x1b")
+        .expect("type without a margin");
+    assert_eq!(editor.bytes(), b"one two three four");
+    assert_eq!(editor.status(), "");
+}
+
+#[test]
+fn textwidth_wrapping_undoes_with_the_insert() {
+    let mut editor = Editor::from_bytes(b"", None, false);
+    editor.execute_ex("set tw=5");
+    editor
+        .execute_keys(b"iab cd ef\x1b")
+        .expect("type past the margin");
+    assert_eq!(editor.bytes(), b"ab cd\nef");
+
+    editor.execute_keys(b"u").expect("undo the insert");
+    assert_eq!(editor.bytes(), b"");
+}
+
+#[test]
+fn set_wrap_toggles_without_errors() {
+    let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+
+    editor.execute_ex("set wrap");
+    editor.execute_ex("set nowrap");
+    editor.execute_ex("set wrap nu");
+    editor.execute_ex("set wrap! linebreak nolbr lbr tw=80 textwidth=72");
+
+    assert_eq!(editor.status(), "");
+}
+
+#[test]
 fn home_and_end_move_the_insert_cursor_without_inserting_escape_bytes() {
     let mut editor = Editor::from_bytes(b"abc\n", None, false);
     editor
