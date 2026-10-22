@@ -2570,7 +2570,7 @@ impl Editor {
                 )?;
             }
             let selected = self.selection_offsets_on_line(index);
-            if syntax_enabled {
+            let columns = if syntax_enabled {
                 write_highlighted_line_with_selection(
                     &mut row,
                     &self.lines[index],
@@ -2582,7 +2582,7 @@ impl Editor {
                     row_width,
                     self.tabstop,
                     selected,
-                )?;
+                )?
             } else {
                 write_plain_line_with_selection(
                     &mut row,
@@ -2591,9 +2591,14 @@ impl Editor {
                     row_width,
                     self.tabstop,
                     selected,
-                )?;
+                )?
+            };
+            // A row that reaches the last column leaves the terminal's cursor
+            // on that column, where erasing to the end of the line would wipe
+            // its final character. There is nothing left to erase anyway.
+            if self.number_column_width() + columns < self.screen_cols {
+                row.extend_from_slice(b"\x1b[K");
             }
-            row.extend_from_slice(b"\x1b[K");
             frame.push(row);
             segment += 1;
             if segment >= starts.len() {
@@ -4676,7 +4681,7 @@ fn write_plain_line<W: Write>(
     width: usize,
     tabstop: usize,
 ) -> io::Result<()> {
-    write_plain_line_with_selection(out, line, screen_left, width, tabstop, None)
+    write_plain_line_with_selection(out, line, screen_left, width, tabstop, None).map(|_| ())
 }
 
 fn write_plain_line_with_selection<W: Write>(
@@ -4686,10 +4691,11 @@ fn write_plain_line_with_selection<W: Write>(
     width: usize,
     tabstop: usize,
     selection: Option<(usize, usize)>,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let visible_end = screen_left.saturating_add(width);
     let mut display_column = 0;
     let mut selected = false;
+    let mut columns = 0;
 
     for (source_offset, byte) in line.iter().copied().enumerate() {
         let length = fragment_len(byte, display_column, tabstop);
@@ -4714,6 +4720,7 @@ fn write_plain_line_with_selection<W: Write>(
                 visible_start - display_column,
                 visible_stop - display_column,
             )?;
+            columns += visible_stop - visible_start;
         }
         display_column = fragment_end;
         if display_column >= visible_end {
@@ -4723,7 +4730,7 @@ fn write_plain_line_with_selection<W: Write>(
     if selected {
         out.write_all(b"\x1b[0m")?;
     }
-    Ok(())
+    Ok(columns)
 }
 
 #[cfg(test)]
@@ -4775,6 +4782,7 @@ fn write_highlighted_line_with_preview<W: Write>(
         tabstop,
         None,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4789,11 +4797,12 @@ fn write_highlighted_line_with_selection<W: Write>(
     width: usize,
     tabstop: usize,
     selection: Option<(usize, usize)>,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let visible_end = screen_left.saturating_add(width);
     let mut display_column = 0;
     let mut active_style = None;
     let mut active_selection = false;
+    let mut columns = 0;
 
     for (source_offset, byte) in line.iter().copied().enumerate() {
         let length = fragment_len(byte, display_column, tabstop);
@@ -4828,6 +4837,7 @@ fn write_highlighted_line_with_selection<W: Write>(
             let start = visible_start - display_column;
             let stop = visible_stop - display_column;
             write_fragment(out, byte, start, stop)?;
+            columns += stop - start;
         }
         display_column = fragment_end;
         if display_column >= visible_end {
@@ -4837,7 +4847,7 @@ fn write_highlighted_line_with_selection<W: Write>(
     if active_style.is_some() || active_selection {
         write!(out, "\x1b[0m")?;
     }
-    Ok(())
+    Ok(columns)
 }
 
 fn find_pattern_before(text: &[u8], pattern: &[u8], before: usize) -> Option<usize> {
@@ -6907,6 +6917,36 @@ mod terminal_event_tests {
         let (rows, rendered) = frame_rows(&mut editor);
         assert_eq!(rows, vec![b"ab cd".to_vec(), Vec::new(), b"~".to_vec()]);
         assert!(ends_with_cursor(&rendered, 2, 1));
+    }
+
+    #[test]
+    fn rows_that_fill_the_screen_are_not_erased_from_the_last_column() {
+        // Erasing to the end of the line after writing the last column wipes
+        // that column's character in real terminals.
+        let mut editor = wrapped_editor(b"ab the end\nabcdefghijk", 6, 10);
+        editor.execute_ex("set lbr nu");
+        editor.screen_cols = 10;
+        editor
+            .render_to(&mut Vec::new(), None)
+            .expect("render frame");
+        assert_eq!(
+            editor.rendered_rows[..4],
+            [
+                b"  1 ab the".to_vec(),
+                b"    end\x1b[K".to_vec(),
+                b"  2 abcdef".to_vec(),
+                b"    ghijk\x1b[K".to_vec(),
+            ]
+        );
+
+        editor.execute_ex("set nowrap");
+        editor
+            .render_to(&mut Vec::new(), None)
+            .expect("render frame");
+        assert_eq!(
+            editor.rendered_rows[..2],
+            [b"  1 ab the".to_vec(), b"  2 abcdef".to_vec()]
+        );
     }
 
     #[test]
