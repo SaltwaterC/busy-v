@@ -93,6 +93,13 @@ it makes porting far easier when the footprint after removing dead code is ~3klo
    word boundaries
  * :set textwidth=N (or tw=N) to break lines while typing past column N
  * :set option! toggles any on/off option, e.g. :set wrap!
+ * :set option? queries its current value, e.g. :set nu? or :set tw? ts?
+ * Vim modelines in the first and last five lines, e.g.
+   `# vim: set ts=4 tw=80 et:` or `# vi:ts=4:tw=80:et`.
+   Modelines apply supported options when opening or reloading files and when
+   constructing an embedded buffer. Use `:set nomodeline` (`noml`) to disable
+   them for subsequent loads, or `:set modelines=N` (`mls=N`) to change the
+   scan size (zero disables scanning). Only option settings are processed.
 
 ## Build and test
 

@@ -264,6 +264,179 @@ fn set_number_accepts_long_and_short_forms() {
 }
 
 #[test]
+fn set_queries_boolean_options_without_changing_them() {
+    let mut editor = Editor::from_bytes(b"one\ntwo\n", None, false);
+    for (name, alias) in [
+        ("number", "nu"),
+        ("wrap", "wrap"),
+        ("linebreak", "lbr"),
+        ("autoindent", "ai"),
+        ("expandtab", "et"),
+        ("flash", "fl"),
+        ("ignorecase", "ic"),
+        ("showmatch", "sm"),
+        ("readonly", "ro"),
+        ("modeline", "ml"),
+    ] {
+        editor.execute_ex(&format!("set no{name}"));
+        for query in [name, alias] {
+            editor.execute_ex(&format!(":set {query}?"));
+            assert_eq!(editor.status(), format!("no{name}"));
+        }
+        // A query must leave the option disabled, so toggling enables it.
+        editor.execute_ex(&format!("set {alias}!"));
+        for query in [name, alias] {
+            editor.execute_ex(&format!("set {query}?"));
+            assert_eq!(editor.status(), name);
+        }
+        editor.execute_ex(&format!("set {alias}! {name}?"));
+        assert_eq!(editor.status(), format!("no{name}"));
+    }
+    assert_eq!(editor.bytes(), b"one\ntwo\n");
+    assert!(!editor.is_modified());
+}
+
+#[test]
+fn set_queries_numeric_options_and_reports_values_in_command_order() {
+    let mut editor = Editor::from_bytes(b"one\n", None, false);
+    editor.execute_ex("set tabstop? ts? textwidth? tw?");
+    assert_eq!(
+        editor.status(),
+        "tabstop=8 tabstop=8 textwidth=0 textwidth=0"
+    );
+
+    editor
+        .execute_ex("set nu? nu nu? ts=4 ts? tw=72 tw? tabstop=2 tabstop? textwidth=0 textwidth?");
+    assert_eq!(
+        editor.status(),
+        "nonumber number tabstop=4 textwidth=72 tabstop=2 textwidth=0"
+    );
+    editor.execute_ex("set ts? tw?");
+    assert_eq!(editor.status(), "tabstop=2 textwidth=0");
+}
+
+#[test]
+fn set_query_errors_are_not_hidden_by_successful_queries() {
+    let mut editor = Editor::from_bytes(b"one\n", None, false);
+    for option in ["missing?", "nu??", "nonu?", "nu!?", "tw=3?"] {
+        editor.execute_ex(&format!("set nu? {option} tw?"));
+        assert_eq!(editor.status(), format!("bad option: {option}"));
+    }
+    editor.execute_ex("set tabstop=0 nu?");
+    assert_eq!(editor.status(), "bad option: tabstop=0");
+}
+
+#[test]
+fn set_query_works_through_keyboard_input() {
+    let mut editor = Editor::from_bytes(b"one\n", None, false);
+    editor.execute_keys(b":set nu?\n").expect("query number");
+    assert_eq!(editor.status(), "nonumber");
+    editor
+        .execute_keys(b":set nu\n:set nu?\n")
+        .expect("enable and query number");
+    assert_eq!(editor.status(), "number");
+}
+
+#[test]
+fn modelines_apply_supported_settings_without_editing_the_buffer() {
+    for data in [
+        b"# vim: set ts=4 tw=80 et nu:\ntext\n".as_slice(),
+        b"/* Vim: set ts=4 tw=80 et nu: */\ntext\n",
+        b"\tvi:ts=4:tw=80:et:nu\r\ntext\r\n",
+        b"# ex: se ts=4 tw=80 et nu: trailing comment\ntext\n",
+        b"vim: ts=4 tw=80 et nu\ntext\n",
+    ] {
+        let mut editor = Editor::from_bytes(data, None, false);
+        assert_eq!(editor.status(), "");
+        editor.execute_ex("set ts? tw? et? nu?");
+        assert_eq!(editor.status(), "tabstop=4 textwidth=80 expandtab number");
+        assert_eq!(editor.bytes(), data);
+        assert_eq!(editor.cursor(), (0, 0));
+        assert!(!editor.is_modified());
+    }
+}
+
+#[test]
+fn modelines_scan_only_the_head_and_tail_once_in_file_order() {
+    let data =
+        b"vim: ts=2\n2\n3\n4\n5\nvim: ts=3\n7\n8\n9\n10\nvim: tw=72\n12\n13\n14\nvim: ts=4\n";
+    let mut editor = Editor::from_bytes(data, None, false);
+    editor.execute_ex("set ts? tw?");
+    assert_eq!(editor.status(), "tabstop=4 textwidth=72");
+
+    let mut editor = Editor::from_bytes(b"vim: nu!\n", None, false);
+    editor.execute_ex("set nu?");
+    assert_eq!(editor.status(), "number");
+
+    let mut editor =
+        Editor::from_bytes(b"1\n2\n3\n4\n5\nvim: tw=12\n7\n8\n9\n10\n11\n", None, false);
+    editor.execute_ex("set tw?");
+    assert_eq!(editor.status(), "textwidth=0");
+}
+
+#[test]
+fn ordinary_text_and_commands_are_not_executed_as_modelines() {
+    for data in [
+        b"prefixvim: set tw=12:\n".as_slice(),
+        b"ex: set tw=12:\n",
+        b"Vim: set tw=12:\n",
+        b"# Vim: tw=12\n",
+    ] {
+        let mut editor = Editor::from_bytes(data, None, false);
+        assert_eq!(editor.status(), "");
+        editor.execute_ex("set tw?");
+        assert_eq!(editor.status(), "textwidth=0");
+    }
+    for data in [
+        b"# vim: set ts=0 tw=12:\n".as_slice(),
+        b"# vim: set tw=12\n",
+        b"# vim: set q! tw=12:\n",
+        b"# vim: set ts=4 | q! tw=12:\n",
+    ] {
+        let mut editor = Editor::from_bytes(data, None, false);
+        assert!(editor.status().starts_with("modeline line 1: "));
+        assert!(!editor.should_quit());
+        assert_eq!(editor.bytes(), data);
+        editor.execute_ex("set tw?");
+        assert_eq!(editor.status(), "textwidth=0");
+    }
+}
+
+#[test]
+fn modeline_controls_apply_to_subsequent_modelines_and_file_reloads() {
+    let mut editor = Editor::from_bytes(b"vim: noml tw=12\nvim: tw=80\n", None, false);
+    editor.execute_ex("set ml? tw?");
+    assert_eq!(editor.status(), "nomodeline textwidth=12");
+
+    let path = std::env::temp_dir().join(format!("busy-v-modelines-{}", std::process::id()));
+    fs::write(&path, b"first\nvim: tw=12\nlast\n").expect("write modeline file");
+    let mut editor = Editor::new(Some(path.clone()), false).expect("open modeline file");
+    editor.execute_ex("set tw?");
+    assert_eq!(editor.status(), "textwidth=12");
+    editor.execute_ex("set noml tw=0");
+    editor.execute_ex("edit");
+    editor.execute_ex("set tw?");
+    assert_eq!(editor.status(), "textwidth=0");
+    editor.execute_ex("set ml mls=1");
+    editor.execute_ex("edit");
+    editor.execute_ex("set tw? modelines?");
+    assert_eq!(editor.status(), "textwidth=0 modelines=1");
+    editor.execute_ex("set modelines=0");
+    editor.execute_ex("edit");
+    editor.execute_ex("set tw?");
+    assert_eq!(editor.status(), "textwidth=0");
+    editor.execute_ex("set mls=5");
+    editor.execute_ex("edit");
+    editor.execute_ex("set tw?");
+    assert_eq!(editor.status(), "textwidth=12");
+
+    fs::write(&path, b"vim: set missing:\n").expect("write invalid modeline");
+    editor.execute_ex("edit");
+    assert_eq!(editor.status(), "modeline line 1: bad option: missing");
+    fs::remove_file(path).expect("remove modeline file");
+}
+
+#[test]
 fn textwidth_breaks_the_line_at_the_last_blank_before_the_margin() {
     let mut editor = Editor::from_bytes(b"", None, false);
     editor.execute_ex("set tw=10");

@@ -26,9 +26,16 @@ analyze:
 c-reference: vi.c standalone.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o vi-c vi.c
 
+
+ifeq ($(OS),Windows_NT)
+# The C reference uses glibc internals that are unavailable in native Windows toolchains.
+test:
+	cargo test
+else
 test: vi$(EXEEXT) c-reference
 	./tests/smoke.sh
 	./tests/reference.sh
+endif
 
 clean:
 	rm -f vi vi.exe
